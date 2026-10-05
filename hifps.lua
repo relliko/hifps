@@ -1,6 +1,6 @@
 addon.name      = 'hifps';
 addon.author    = 'relliko';
-addon.version   = '0.6.1';
+addon.version   = '0.6.2';
 addon.desc      = 'Experimental: runs the client above 60fps by feeding real frame time into the game step.';
 
 require 'common';
@@ -251,26 +251,39 @@ local function enable()
     local smooth = T{};
     local ops = T{};
     for _, l in ipairs(SMOOTH_LOOPS) do
-        if (not add(l.sites, 's')) then return false; end
+        -- Check the loop's constants first. If something else (e.g. another addon) already changed
+        -- one, leave this loop on whole ticks instead of refusing to load.
+        local bad = nil;
+        local l_smooth, l_ops = T{}, T{};
         if (l.imm ~= nil) then
             local a = base + l.imm;
             local kb = ffi.new('float[1]', l.k);
             local want = ffi.string(ffi.cast('const char*', kb), 4);
             local have = ffi.string(ffi.cast('const char*', a), 4);
             if (ashita.memory.read_uint8(a - 1) ~= 0x68 or have ~= want) then
-                err(('Smoothing constant at %08X does not match; client differs from the analysed one. Not patching.'):fmt(a));
-                return false;
+                bad = a - 1;
+            else
+                l_smooth:append({ addr = a, k = l.k, backup = ashita.memory.read_array(a, 4) });
             end
-            smooth:append({ addr = a, k = l.k, backup = ashita.memory.read_array(a, 4) });
         end
         for _, o in ipairs(l.ops or {}) do
             local a = base + o.at;
             local c = bit.tobit(base + o.const);
-            if (bit.tobit(ashita.memory.read_uint32(a)) ~= c or ashita.memory.read_uint8(a - 2) ~= 0xD8) then
-                err(('Instruction at %08X does not match; client differs from the analysed one. Not patching.'):fmt(a - 2));
-                return false;
+            if (bad == nil) then
+                if (bit.tobit(ashita.memory.read_uint32(a)) ~= c or ashita.memory.read_uint8(a - 2) ~= 0xD8) then
+                    bad = a - 2;
+                else
+                    l_ops:append({ addr = a, backup = ashita.memory.read_array(a, 4), v = ashita.memory.read_float(c), mode = o.mode });
+                end
             end
-            ops:append({ addr = a, backup = ashita.memory.read_array(a, 4), v = ashita.memory.read_float(c), mode = o.mode });
+        end
+        if (bad ~= nil) then
+            msg(('Code at %08X was already changed (another addon?). That camera loop stays on whole ticks; everything else is patched.'):fmt(bad));
+            if (not add(l.sites, 'i')) then return false; end
+        else
+            if (not add(l.sites, 's')) then return false; end
+            for _, x in ipairs(l_smooth) do smooth:append(x); end
+            for _, x in ipairs(l_ops) do ops:append(x); end
         end
     end
     if (#ops > MAX_OPS) then err('Too many operand patches.'); return false; end
