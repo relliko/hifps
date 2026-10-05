@@ -1,5 +1,5 @@
 addon.name      = 'hifps';
-addon.author    = 'relliko';
+addon.author    = 'relli';
 addon.version   = '0.7.3';
 addon.desc      = 'Runs the client above 60fps by feeding real frame time into the game step.';
 
