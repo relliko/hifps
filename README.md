@@ -11,7 +11,7 @@ The client advances timers, animation and motion by a per-frame step measured in
 hifps:
 
 - replaces both copies of the getter. One returns the real frame time in ticks (fractional), and the other returns whole ticks accumulated from real time (0, 1, 2...).
-- points each of the 218 call sites at the right one: the 124 that truncate the step to an integer get whole ticks, and the rest get the fractional step.
+- points each of the 218 call sites at the right one: the 126 that truncate the step to an integer get whole ticks, and the rest get the fractional step.
 - sets the fps divisor to 0 (uncapped) and caps the frame rate with its own QueryPerformanceCounter-based limiter.
 
 It checks every call site before patching and refuses to patch if the client doesn't match. Unloading restores every original byte and the divisor.
