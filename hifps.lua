@@ -1,6 +1,6 @@
 addon.name      = 'hifps';
 addon.author    = 'relliko';
-addon.version   = '0.7.1';
+addon.version   = '0.7.2';
 addon.desc      = 'Runs the client above 60fps by feeding real frame time into the game step.';
 
 require 'common';
@@ -498,8 +498,9 @@ ashita.events.register('d3d_present', 'present_cb', function ()
             ImGuiWindowFlags_AlwaysAutoResize, ImGuiWindowFlags_NoFocusOnAppearing, ImGuiWindowFlags_NoNav,
             ImGuiWindowFlags_NoInputs);
         if (imgui.Begin('hifps_counter', true, flags)) then
-            imgui.SetWindowFontScale(0.8);
+            imgui.PushFont(imgui.GetFont(), imgui.GetFontSize() * 0.8);
             imgui.Text(('%.0f'):fmt(state.fps));
+            imgui.PopFont();
         end
         imgui.End();
         imgui.PopStyleVar(4);
