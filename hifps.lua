@@ -1,6 +1,6 @@
 addon.name      = 'hifps';
 addon.author    = 'relliko';
-addon.version   = '0.4';
+addon.version   = '0.5';
 addon.desc      = 'Experimental: runs the client above 60fps by feeding real frame time into the game step.';
 
 require 'common';
@@ -25,6 +25,10 @@ pcall(ffi.cdef, [[
 *   Unloading restores every original byte and the divisor.
 *
 *   v0.4: moved the music-start and push-through-entity sites to whole ticks (found by bisecting).
+*   v0.5: camera follow smoothing. The camera eases toward its target with a fixed-step loop
+*   (pos += (target - pos) * k, once per whole tick). With whole ticks above 60fps it only moved
+*   every other frame, which looked like blur while turning. Those loops now run once per frame with
+*   k rescaled to the real step: k' = 1 - (1 - k)^step, which matches stock exactly at whole ticks.
 *
 *   Bisect mode (local server only): points a group of call sites at a stub that always returns 1.0,
 *   the stock 60fps value, so you can find which site causes a bug. Sites in that group run fast
@@ -48,8 +52,8 @@ local FRAC_SITES = {
 };
 -- Call sites that truncate the step to an integer.
 local INT_SITES = {
-    0x005A50, 0x007BB6, 0x007D74, 0x018A10, 0x018D0E, 0x01BC9C, 0x01EEFE, 0x01F5A2,
-    0x01F66B, 0x01F711, 0x01FA38, 0x01FE7C, 0x020148, 0x021185, 0x0211C1, 0x021207,
+    0x005A50, 0x007BB6, 0x007D74, 0x018A10, 0x018D0E, 0x01BC9C, 0x01EEFE,
+    0x01FA38, 0x01FE7C, 0x020148, 0x021185, 0x0211C1, 0x021207,
     0x021243, 0x0219A0, 0x0375A0, 0x0375FB, 0x039366, 0x087495, 0x087E99, 0x0884CC,
     0x0884F5, 0x0885B1, 0x0886B3, 0x088CA7, 0x088CD4, 0x088CF9, 0x088E63, 0x088ECF,
     0x089061, 0x0891FF, 0x089228, 0x0892E7, 0x0893CB, 0x0898F5, 0x089933, 0x089958,
@@ -69,11 +73,20 @@ local INT_SITES = {
     0x0A8778,   -- push-through-entity delay
 };
 
+-- Fixed-step smoothing loops: "n = (int)step; repeat n times: v += (target - v) * k", with k pushed
+-- as an immediate float. Their call sites get the 1.0 stub (one pass per frame) and the immediate is
+-- rewritten every frame to 1 - (1 - k)^step. imm = offset of the 4 immediate bytes (after a 68 push).
+local SMOOTH_LOOPS = {
+    { sites = { 0x01F5A2 },           imm = 0x01F5D4, k = 0.25 },  -- camera follow
+    { sites = { 0x01F66B, 0x01F711 }, imm = 0x01F6C7, k = 0.05 },  -- camera ease (stops when close)
+};
+
 local MIN_STEP = 0.05;  -- ticks; ~1200fps
 local MAX_STEP = 4.0;   -- ticks; hitches longer than this slow the game down like before
 
 local state = T{
-    sites       = T{},      -- { addr, kind ('f'|'i'), backup (rel32 bytes), target }
+    sites       = T{},      -- { addr, kind ('f'|'i'|'s'), backup (rel32 bytes), target }
+    smooth      = T{},      -- { addr (immediate), k, backup, prot }
     getters     = T{},      -- { addr, backup }
     mem         = nil,      -- +0 frac step, +4 whole step, +16 stub code, +24 1.0f
     g_frac      = nil,
@@ -139,6 +152,11 @@ local function set_divisor(v)
 end
 
 local function disable()
+    for _, l in ipairs(state.smooth) do
+        ashita.memory.write_array(l.addr, l.backup);
+        ashita.memory.protect(l.addr, 4, l.prot);
+    end
+    state.smooth = T{};
     for _, s in ipairs(state.sites) do
         if (s.patched) then write_bytes(s.addr + 1, s.backup); end
     end
@@ -160,7 +178,7 @@ local function apply_targets()
     local b = state.bisect;
     local mid = b and math.floor((b.lo + b.hi) / 2) or 0;
     for i, s in ipairs(state.sites) do
-        local t = (s.kind == 'f') and state.g_frac or state.g_int;
+        local t = (s.kind == 'f') and state.g_frac or (s.kind == 's') and state.stub or state.g_int;
         if (b ~= nil and i >= b.lo and i <= mid) then t = state.stub; end
         if (not point_site(s, t)) then return false; end
         s.patched = true;
@@ -209,6 +227,19 @@ local function enable()
         return true;
     end
     if (not add(FRAC_SITES, 'f') or not add(INT_SITES, 'i')) then return false; end
+    local smooth = T{};
+    for _, l in ipairs(SMOOTH_LOOPS) do
+        if (not add(l.sites, 's')) then return false; end
+        local a = base + l.imm;
+        local kb = ffi.new('float[1]', l.k);
+        local want = ffi.string(ffi.cast('const char*', kb), 4);
+        local have = ffi.string(ffi.cast('const char*', a), 4);
+        if (ashita.memory.read_uint8(a - 1) ~= 0x68 or have ~= want) then
+            err(('Smoothing constant at %08X does not match; client differs from the analysed one. Not patching.'):fmt(a));
+            return false;
+        end
+        smooth:append({ addr = a, k = l.k, backup = ashita.memory.read_array(a, 4) });
+    end
 
     -- Our memory: two step floats, and an executable stub "fld dword [1.0]; ret" for bisecting.
     state.mem = ashita.memory.alloc(32);
@@ -240,6 +271,16 @@ local function enable()
     state.g_frac, state.g_int = addrs[1], addrs[2];
 
     state.sites = sites;
+    for _, l in ipairs(smooth) do
+        local ok, prot = ashita.memory.unprotect(l.addr, 4);
+        if (not ok) then
+            err('Failed to unprotect a smoothing constant; restoring.');
+            disable();
+            return false;
+        end
+        l.prot = prot;
+        state.smooth:append(l);
+    end
     if (not apply_targets()) then
         err('Failed to redirect a call; restoring.');
         disable();
@@ -264,7 +305,7 @@ local function bisect_report()
         state.bisect = { lo = b.lo, hi = b.lo, round = b.round };
         local mid = b.lo;
         for i, s2 in ipairs(state.sites) do
-            local t = (s2.kind == 'f') and state.g_frac or state.g_int;
+            local t = (s2.kind == 'f') and state.g_frac or (s2.kind == 's') and state.stub or state.g_int;
             if (i == mid) then t = state.stub; end
             point_site(s2, t);
         end
@@ -310,6 +351,11 @@ ashita.events.register('d3d_present', 'present_cb', function ()
     local whole = math.floor(state.accum);
     state.accum = state.accum - whole;
     ashita.memory.write_float(state.mem + 4, whole);
+
+    -- Smoothing loops run once per frame; scale their factor to this frame's step.
+    for _, l in ipairs(state.smooth) do
+        ashita.memory.write_float(l.addr, 1.0 - math.pow(1.0 - l.k, step));
+    end
 
     state.frames = state.frames + 1;
     if (t - state.fps_timer >= 1.0) then

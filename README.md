@@ -2,7 +2,7 @@
 
 Experimental Ashita v4 addon that runs Final Fantasy XI above 60fps while keeping game speed tied to real time.
 
-> **Experimental.** Fixed so far: lock-on camera (v0.2), late music and pushing through entities (v0.4). Some game systems may still behave differently from a stock client. Test on a local server before using it anywhere else, and check your server's rules on client modifications.
+> **Experimental.** Fixed so far: lock-on camera (v0.2), late music and pushing through entities (v0.4), blur while turning the camera in motion (v0.5). Some game systems may still behave differently from a stock client. Test on a local server before using it anywhere else, and check your server's rules on client modifications.
 
 ## How it works
 
@@ -11,7 +11,8 @@ The client advances timers, animation and motion by a per-frame step measured in
 hifps:
 
 - replaces both copies of the getter. One returns the real frame time in ticks (fractional), and the other returns whole ticks accumulated from real time (0, 1, 2...).
-- points each of the 218 call sites at the right one: the 126 that truncate the step to an integer get whole ticks, and the rest get the fractional step.
+- points each of the 218 call sites at the right one: the 123 that truncate the step to an integer get whole ticks, and 92 get the fractional step.
+- runs the camera's two smoothing loops (3 call sites) once per frame and rescales their easing factor to the real frame time, so the camera moves every frame at the stock speed.
 - sets the fps divisor to 0 (uncapped) and caps the frame rate with its own QueryPerformanceCounter-based limiter.
 
 It checks every call site before patching and refuses to patch if the client doesn't match. Unloading restores every original byte and the divisor.
