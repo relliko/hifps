@@ -278,7 +278,9 @@ local function enable()
             end
         end
         if (bad ~= nil) then
-            msg(('Code at %08X was already changed (another addon?). That camera loop stays on whole ticks; everything else is patched.'):fmt(bad));
+            local found = ashita.memory.read_array(bad, 6);
+            msg(('Code at %08X was already changed (another addon?), found %02X %02X %02X %02X %02X %02X. That camera loop stays on whole ticks; everything else is patched.'):fmt(
+                bad, found[1], found[2], found[3], found[4], found[5], found[6]));
             if (not add(l.sites, 'i')) then return false; end
         else
             if (not add(l.sites, 's')) then return false; end
