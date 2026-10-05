@@ -489,8 +489,8 @@ ashita.events.register('d3d_present', 'present_cb', function ()
     if (state.counter) then
         -- Small box hugging the top-left corner: tight padding, no rounding or border, no min size.
         imgui.SetNextWindowPos({ 0, 0 }, ImGuiCond_Always);
-        imgui.SetNextWindowBgAlpha(0.35);
-        imgui.PushStyleVar(ImGuiStyleVar_WindowPadding, { 3, 1 });
+        imgui.SetNextWindowBgAlpha(0.5);
+        imgui.PushStyleVar(ImGuiStyleVar_WindowPadding, { 3, 0 });
         imgui.PushStyleVar(ImGuiStyleVar_WindowMinSize, { 1, 1 });
         imgui.PushStyleVar(ImGuiStyleVar_WindowRounding, 0);
         imgui.PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
@@ -498,7 +498,7 @@ ashita.events.register('d3d_present', 'present_cb', function ()
             ImGuiWindowFlags_AlwaysAutoResize, ImGuiWindowFlags_NoFocusOnAppearing, ImGuiWindowFlags_NoNav,
             ImGuiWindowFlags_NoInputs);
         if (imgui.Begin('hifps_counter', true, flags)) then
-            imgui.SetWindowFontScale(0.85);
+            imgui.SetWindowFontScale(0.8);
             imgui.Text(('%.0f'):fmt(state.fps));
         end
         imgui.End();
