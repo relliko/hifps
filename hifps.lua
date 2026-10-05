@@ -1,6 +1,6 @@
 addon.name      = 'hifps';
 addon.author    = 'relliko';
-addon.version   = '0.7';
+addon.version   = '0.7.1';
 addon.desc      = 'Runs the client above 60fps by feeding real frame time into the game step.';
 
 require 'common';
@@ -487,15 +487,22 @@ ashita.events.register('d3d_present', 'present_cb', function ()
     end
 
     if (state.counter) then
+        -- Small box hugging the top-left corner: tight padding, no rounding or border, no min size.
         imgui.SetNextWindowPos({ 0, 0 }, ImGuiCond_Always);
         imgui.SetNextWindowBgAlpha(0.35);
+        imgui.PushStyleVar(ImGuiStyleVar_WindowPadding, { 3, 1 });
+        imgui.PushStyleVar(ImGuiStyleVar_WindowMinSize, { 1, 1 });
+        imgui.PushStyleVar(ImGuiStyleVar_WindowRounding, 0);
+        imgui.PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
         local flags = bit.bor(ImGuiWindowFlags_NoDecoration, ImGuiWindowFlags_NoMove, ImGuiWindowFlags_NoSavedSettings,
             ImGuiWindowFlags_AlwaysAutoResize, ImGuiWindowFlags_NoFocusOnAppearing, ImGuiWindowFlags_NoNav,
             ImGuiWindowFlags_NoInputs);
         if (imgui.Begin('hifps_counter', true, flags)) then
-            imgui.Text(('%.0f fps'):fmt(state.fps));
+            imgui.SetWindowFontScale(0.85);
+            imgui.Text(('%.0f'):fmt(state.fps));
         end
         imgui.End();
+        imgui.PopStyleVar(4);
     end
 end);
 
