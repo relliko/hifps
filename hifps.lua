@@ -1,6 +1,6 @@
 addon.name      = 'hifps';
 addon.author    = 'relliko';
-addon.version   = '0.6';
+addon.version   = '0.6.1';
 addon.desc      = 'Experimental: runs the client above 60fps by feeding real frame time into the game step.';
 
 require 'common';
@@ -404,7 +404,10 @@ ashita.events.register('d3d_present', 'present_cb', function ()
     end
     for _, o in ipairs(state.ops) do
         local v = o.v * step;
-        if (o.mode == 'ease' and o.v > 0 and o.v < 1) then v = 1.0 - math.pow(1.0 - o.v, step); end
+        local m = math.abs(o.v);
+        if (o.mode == 'ease' and m > 0 and m < 1) then
+            v = (1.0 - math.pow(1.0 - m, step)) * (o.v < 0 and -1 or 1);
+        end
         ashita.memory.write_float(o.slot, v);
     end
 
