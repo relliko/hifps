@@ -1,8 +1,8 @@
 # hifps
 
-Experimental Ashita v4 addon that runs Final Fantasy XI above 60fps while keeping game speed tied to real time.
+Ashita v4 addon that runs Final Fantasy XI above 60fps while keeping game speed tied to real time.
 
-> **Experimental.** Fixed so far: lock-on camera (v0.2), late music and pushing through entities (v0.4), blur while turning the camera in motion (v0.5, v0.6). Some game systems may still behave differently from a stock client. Test on a local server before using it anywhere else, and check your server's rules on client modifications.
+> Fixed along the way: lock-on camera (v0.2), late music and pushing through entities (v0.4), blur while turning the camera in motion (v0.5, v0.6). Check your server's rules on client modifications before using it.
 
 ## How it works
 
@@ -27,6 +27,7 @@ Copy `hifps.lua` to `<Ashita>\addons\hifps\hifps.lua`, then run `/addon load hif
 | --- | --- |
 | `/hifps` | Show status: fps, current step, limit. |
 | `/hifps limit <n>` | Set the frame cap (default 120). `0` removes it; use vsync or a driver cap instead. |
+| `/hifps counter` | Show or hide the fps counter in the top-left corner (shown by default). |
 | `/hifps off` / `/hifps on` | Restore the original code / re-apply the patch. |
 | `/hifps bisect start` | Start bisecting a bug. Half of the remaining call sites go back to the stock 60fps step. |
 | `/hifps bisect fixed` / `broken` | Report whether the bug is gone or still there; repeat until it names a single call site. |
@@ -35,5 +36,7 @@ Copy `hifps.lua` to `<Ashita>\addons\hifps\hifps.lua`, then run `/addon load hif
 While bisecting, sites set back to stock run fast above 60fps. Only bisect on a local server.
 
 ## Compatibility
+
+Works alongside xicamera. If another addon changes the camera code in a way hifps can't adjust for, hifps prints a camera warning saying which part is affected.
 
 Call-site offsets were taken from the PhoenixXI client's FFXiMain.dll. On any other client build, the addon refuses to patch.

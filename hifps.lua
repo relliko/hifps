@@ -1,11 +1,12 @@
 addon.name      = 'hifps';
 addon.author    = 'relliko';
-addon.version   = '0.6.2';
-addon.desc      = 'Experimental: runs the client above 60fps by feeding real frame time into the game step.';
+addon.version   = '0.7';
+addon.desc      = 'Runs the client above 60fps by feeding real frame time into the game step.';
 
 require 'common';
 local ffi  = require 'ffi';
 local chat = require 'chat';
+local imgui = require 'imgui';
 
 pcall(ffi.cdef, [[
     int __stdcall QueryPerformanceCounter(int64_t* count);
@@ -32,6 +33,12 @@ pcall(ffi.cdef, [[
 *   v0.6: the camera distance/collision loop (also per whole tick) runs once per frame too. Its gains
 *   and its delay timer read float constants from memory; those instructions are pointed at our own
 *   slots, rewritten every frame: gains as 1 - (1 - g)^step, per-tick amounts as v * step.
+*   v0.7: works alongside camera addons that redirect the same operands (xicamera points the two
+*   0.125 "jitter" gains at its own 1.0). An operand that points somewhere else is left alone; if its
+*   value behaves the same at any frame rate (a gain of 0 or 1, a per-tick amount of 0) the loop still
+*   runs once per frame, otherwise hifps leaves that loop alone and prints a camera warning. Operands
+*   are re-checked every frame, so either load order works, and hifps keeps its memory alive on unload
+*   if another addon might still write a pointer to it back.
 *
 *   Bisect mode (local server only): points a group of call sites at a stub that always returns 1.0,
 *   the stock 60fps value, so you can find which site causes a bug. Sites in that group run fast
@@ -83,9 +90,9 @@ local INT_SITES = {
 -- at = offset of the instruction's disp32, const = offset of the constant it reads. The disp32 is
 -- pointed at a slot of ours; mode 'ease' gets 1 - (1 - v)^step, 'lin' gets v * step.
 local SMOOTH_LOOPS = {
-    { sites = { 0x01F5A2 },           imm = 0x01F5D4, k = 0.25 },  -- camera follow
-    { sites = { 0x01F66B, 0x01F711 }, imm = 0x01F6C7, k = 0.05 },  -- camera ease (stops when close)
-    { sites = { 0x01FA38, 0x01FE7C }, ops = {                       -- camera distance / collision
+    { name = 'camera follow', sites = { 0x01F5A2 },           imm = 0x01F5D4, k = 0.25 },
+    { name = 'camera ease',   sites = { 0x01F66B, 0x01F711 }, imm = 0x01F6C7, k = 0.05 },
+    { name = 'camera distance/collision', sites = { 0x01FA38, 0x01FE7C }, ops = {
         { at = 0x01FA57, const = 0x32961C, mode = 'lin'  },         -- delay timer -= 1.0
         { at = 0x01FCCA, const = 0x32A3E0, mode = 'lin'  },         -- per-tick move amount
         { at = 0x01FD28, const = 0x329A08, mode = 'ease' },         -- pull in when too far
@@ -103,7 +110,7 @@ local MAX_STEP = 4.0;   -- ticks; hitches longer than this slow the game down li
 local state = T{
     sites       = T{},      -- { addr, kind ('f'|'i'|'s'), backup (rel32 bytes), target }
     smooth      = T{},      -- { addr (immediate), k, backup, prot }
-    ops         = T{},      -- { addr (disp32), backup, slot, v, mode }
+    ops         = T{},      -- { addr (disp32), const (game constant address), v (its value), mode, slot, name, warned }
     getters     = T{},      -- { addr, backup }
     mem         = nil,      -- +0 frac step, +4 whole step, +16 stub code, +24 1.0f
     g_frac      = nil,
@@ -119,6 +126,7 @@ local state = T{
     fps         = 0,
     fps_timer   = 0,
     step        = 1.0,
+    counter     = true,     -- fps counter in the top left
     bisect      = nil,      -- { lo, hi, round }
 };
 
@@ -164,6 +172,19 @@ local function find_divisor()
     return p + 0x30;
 end
 
+-- Unsigned address from a bit.tobit / read_uint32 value.
+local function u32(v) v = bit.tobit(v); return v < 0 and v + 4294967296 or v; end
+
+-- True if an operand with this value behaves the same at any step, so it needs no rescaling.
+local function step_invariant(mode, v)
+    if (mode == 'ease') then return v == 0 or math.abs(v) == 1; end
+    return v == 0;
+end
+
+local function camera_warning(name, addr, detail)
+    err(('Camera warning: the %s code at %08X was changed by another addon (%s) in a way hifps cannot adjust for. That part of the camera may blur or move at the wrong speed above 60fps. Unload the other camera addon, or use /hifps limit 60.'):fmt(name, addr, detail));
+end
+
 local function set_divisor(v)
     if (state.div_ptr ~= nil) then ashita.memory.write_uint32(state.div_ptr, v); end
 end
@@ -174,8 +195,20 @@ local function disable()
         ashita.memory.protect(l.addr, 4, l.prot);
     end
     state.smooth = T{};
+    -- Operands: restore only the ones that still point at our slot. If another addon holds one, it
+    -- may write our slot address back into the code when it unloads, so keep our memory alive with
+    -- the stock values in the slots.
+    local keep_mem = false;
     for _, o in ipairs(state.ops) do
-        write_bytes(o.addr, o.backup);
+        local d = bit.tobit(ashita.memory.read_uint32(o.addr));
+        if (d == bit.tobit(o.slot)) then
+            write_bytes(o.addr, le32(o.const));
+        elseif (d ~= o.const) then
+            keep_mem = true;
+        end
+    end
+    if (keep_mem) then
+        for _, o in ipairs(state.ops) do ashita.memory.write_float(o.slot, o.v); end
     end
     state.ops = T{};
     for _, s in ipairs(state.sites) do
@@ -188,7 +221,7 @@ local function disable()
     state.getters = T{};
     if (state.div_orig ~= nil) then set_divisor(state.div_orig); state.div_orig = nil; end
     if (state.mem ~= nil) then
-        ashita.memory.dealloc(state.mem);
+        if (not keep_mem) then ashita.memory.dealloc(state.mem); end
         state.mem = nil;
     end
     state.bisect = nil;
@@ -266,21 +299,29 @@ local function enable()
                 l_smooth:append({ addr = a, k = l.k, backup = ashita.memory.read_array(a, 4) });
             end
         end
+        local detail = nil;
+        if (bad ~= nil) then
+            local f = ashita.memory.read_array(bad, 5);
+            detail = ('found %02X %02X %02X %02X %02X'):fmt(f[1], f[2], f[3], f[4], f[5]);
+        end
         for _, o in ipairs(l.ops or {}) do
             local a = base + o.at;
             local c = bit.tobit(base + o.const);
             if (bad == nil) then
-                if (bit.tobit(ashita.memory.read_uint32(a)) ~= c or ashita.memory.read_uint8(a - 2) ~= 0xD8) then
-                    bad = a - 2;
+                local d = bit.tobit(ashita.memory.read_uint32(a));
+                if (ashita.memory.read_uint8(a - 2) ~= 0xD8) then
+                    local f = ashita.memory.read_array(a - 2, 6);
+                    bad, detail = a - 2, ('found %02X %02X %02X %02X %02X %02X'):fmt(f[1], f[2], f[3], f[4], f[5], f[6]);
+                elseif (d ~= c and not step_invariant(o.mode, ashita.memory.read_float(u32(d)))) then
+                    -- Redirected by another addon to a value that depends on the frame rate.
+                    bad, detail = a - 2, ('value %g'):fmt(ashita.memory.read_float(u32(d)));
                 else
-                    l_ops:append({ addr = a, backup = ashita.memory.read_array(a, 4), v = ashita.memory.read_float(c), mode = o.mode });
+                    l_ops:append({ addr = a, const = c, v = ashita.memory.read_float(u32(c)), mode = o.mode, name = l.name });
                 end
             end
         end
         if (bad ~= nil) then
-            local found = ashita.memory.read_array(bad, 6);
-            msg(('Code at %08X was already changed (another addon?), found %02X %02X %02X %02X %02X %02X. That camera loop stays on whole ticks; everything else is patched.'):fmt(
-                bad, found[1], found[2], found[3], found[4], found[5], found[6]));
+            camera_warning(l.name, bad, detail);
             if (not add(l.sites, 'i')) then return false; end
         else
             if (not add(l.sites, 's')) then return false; end
@@ -333,14 +374,17 @@ local function enable()
         state.smooth:append(l);
     end
     for i, o in ipairs(ops) do
-        o.slot = state.mem + 32 + (i - 1) * 4;
+        o.slot = u32(state.mem + 32 + (i - 1) * 4);
         ashita.memory.write_float(o.slot, o.v);
-        if (not write_bytes(o.addr, le32(o.slot))) then
-            err('Failed to redirect an operand; restoring.');
-            disable();
-            return false;
-        end
         state.ops:append(o);
+        -- Take over only operands that still point at the game's constant; leave other addons' alone.
+        if (bit.tobit(ashita.memory.read_uint32(o.addr)) == o.const) then
+            if (not write_bytes(o.addr, le32(o.slot))) then
+                err('Failed to redirect an operand; restoring.');
+                disable();
+                return false;
+            end
+        end
     end
     if (not apply_targets()) then
         err('Failed to redirect a call; restoring.');
@@ -424,6 +468,15 @@ ashita.events.register('d3d_present', 'present_cb', function ()
             v = (1.0 - math.pow(1.0 - m, step)) * (o.v < 0 and -1 or 1);
         end
         ashita.memory.write_float(o.slot, v);
+        -- Another addon may have redirected this operand since, or handed it back.
+        local d = bit.tobit(ashita.memory.read_uint32(o.addr));
+        if (d == o.const) then
+            write_bytes(o.addr, le32(o.slot));
+            o.warned = false;
+        elseif (d ~= bit.tobit(o.slot) and not o.warned and not step_invariant(o.mode, ashita.memory.read_float(u32(d)))) then
+            camera_warning(o.name, o.addr - 2, ('value %g'):fmt(ashita.memory.read_float(u32(d))));
+            o.warned = true;
+        end
     end
 
     state.frames = state.frames + 1;
@@ -431,6 +484,18 @@ ashita.events.register('d3d_present', 'present_cb', function ()
         state.fps = state.frames / (t - state.fps_timer);
         state.frames = 0;
         state.fps_timer = t;
+    end
+
+    if (state.counter) then
+        imgui.SetNextWindowPos({ 0, 0 }, ImGuiCond_Always);
+        imgui.SetNextWindowBgAlpha(0.35);
+        local flags = bit.bor(ImGuiWindowFlags_NoDecoration, ImGuiWindowFlags_NoMove, ImGuiWindowFlags_NoSavedSettings,
+            ImGuiWindowFlags_AlwaysAutoResize, ImGuiWindowFlags_NoFocusOnAppearing, ImGuiWindowFlags_NoNav,
+            ImGuiWindowFlags_NoInputs);
+        if (imgui.Begin('hifps_counter', true, flags)) then
+            imgui.Text(('%.0f fps'):fmt(state.fps));
+        end
+        imgui.End();
     end
 end);
 
@@ -442,6 +507,11 @@ ashita.events.register('command', 'command_cb', function (e)
     if (#args >= 3 and args[2] == 'limit') then
         state.limit = math.max(0, args[3]:number_or(120));
         msg(('Frame limit set to %s.'):fmt(state.limit > 0 and tostring(state.limit) or 'none'));
+        return;
+    end
+    if (#args >= 2 and args[2] == 'counter') then
+        state.counter = not state.counter;
+        msg(('FPS counter %s.'):fmt(state.counter and 'shown' or 'hidden'));
         return;
     end
     if (#args >= 2 and args[2] == 'off') then
@@ -480,7 +550,7 @@ ashita.events.register('command', 'command_cb', function (e)
         return;
     end
 
-    msg(('%s, %.1f fps, step %.3f ticks, limit %s. Commands: /hifps limit <n|0>, /hifps on, /hifps off, /hifps bisect start|fixed|broken|stop'):fmt(
+    msg(('%s, %.1f fps, step %.3f ticks, limit %s. Commands: /hifps limit <n|0>, /hifps counter, /hifps on, /hifps off, /hifps bisect start|fixed|broken|stop'):fmt(
         state.mem ~= nil and 'Enabled' or 'Disabled', state.fps, state.step,
         state.limit > 0 and tostring(state.limit) or 'none'));
 end);
