@@ -2,7 +2,7 @@
 
 Experimental Ashita v4 addon that runs Final Fantasy XI above 60fps while keeping game speed tied to real time.
 
-> **Experimental.** Known issues: lock-on camera (fixed in v0.2), music sometimes starts late, and you can't push through entities after the usual short delay. Some game systems may still behave differently from a stock client. Test on a local server before using it anywhere else, and check your server's rules on client modifications.
+> **Experimental.** Fixed so far: lock-on camera (v0.2), late music and pushing through entities (v0.4). Some game systems may still behave differently from a stock client. Test on a local server before using it anywhere else, and check your server's rules on client modifications.
 
 ## How it works
 

@@ -1,6 +1,6 @@
 addon.name      = 'hifps';
 addon.author    = 'relliko';
-addon.version   = '0.3';
+addon.version   = '0.4';
 addon.desc      = 'Experimental: runs the client above 60fps by feeding real frame time into the game step.';
 
 require 'common';
@@ -24,6 +24,8 @@ pcall(ffi.cdef, [[
 *   The divisor is set to 0 (uncapped) and an optional limiter caps the frame rate.
 *   Unloading restores every original byte and the divisor.
 *
+*   v0.4: moved the music-start and push-through-entity sites to whole ticks (found by bisecting).
+*
 *   Bisect mode (local server only): points a group of call sites at a stub that always returns 1.0,
 *   the stock 60fps value, so you can find which site causes a bug. Sites in that group run fast
 *   above 60fps while it is active.
@@ -33,9 +35,9 @@ pcall(ffi.cdef, [[
 local FRAC_SITES = {
     0x00766F, 0x01A9AB, 0x01B5D4, 0x01C5AF, 0x01F01F, 0x01F0F2, 0x01F82F, 0x01F87F,
     0x01F8D5, 0x01F91D, 0x0205B1, 0x02198E, 0x02AD55, 0x033ED1, 0x033FAB, 0x035944,
-    0x0368B6, 0x0368CE, 0x03746F, 0x0381D4, 0x0478BF, 0x0478D7, 0x06A000, 0x08D383,
+    0x0368B6, 0x0368CE, 0x0381D4, 0x0478BF, 0x0478D7, 0x06A000, 0x08D383,
     0x08D38F, 0x08D39D, 0x08D61D, 0x08D62B, 0x08D639, 0x08D647, 0x08D655, 0x09729C,
-    0x0A57F9, 0x0A7B8A, 0x0A8778, 0x0A9FC7, 0x0AA1F7, 0x0AAB78, 0x0AADF5, 0x0B0829,
+    0x0A57F9, 0x0A7B8A, 0x0A9FC7, 0x0AA1F7, 0x0AAB78, 0x0AADF5, 0x0B0829,
     0x0B08BF, 0x0B2F4E, 0x0B2F9E, 0x0B2FE1, 0x0B32A8, 0x0B32F0, 0x0B3333, 0x0B3376,
     0x0B56F2, 0x0B57FD, 0x0B5840, 0x0B587D, 0x0C4878, 0x0C648E, 0x0C65BA, 0x0C6882,
     0x0C6C64, 0x0C76CA, 0x0C7F13, 0x0C8AC8, 0x0C8AE7, 0x0CAEEA, 0x0CBC68, 0x0CDF96,
@@ -62,6 +64,9 @@ local INT_SITES = {
     0x1E187B, 0x1EEFDA, 0x1EF008, 0x1EF067, 0x1FB9DC, 0x1FBA03, 0x2014F6, 0x2160A3,
     0x2164C3, 0x21F263, 0x21F2C0, 0x220364, 0x220998, 0x220B14, 0x220EA2, 0x221428,
     0x221492, 0x24C316, 0x24E8BE, 0x24EB4D,
+    -- Found by bisecting: these truncate after a jump, so the scan missed them.
+    0x03746F,   -- music start countdown
+    0x0A8778,   -- push-through-entity delay
 };
 
 local MIN_STEP = 0.05;  -- ticks; ~1200fps
