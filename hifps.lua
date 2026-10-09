@@ -1,6 +1,6 @@
 addon.name      = 'hifps';
 addon.author    = 'Relli';
-addon.version   = '0.9.3';
+addon.version   = '0.9.4';
 addon.desc      = 'Runs the client above 60fps by feeding real frame time into the game step.';
 
 require 'common';
@@ -77,6 +77,11 @@ pcall(ffi.cdef, [[
 *   'occlusion' allows 3% slack so a 120 cap that measures 119.9fps still counts as 120.
 *   v0.9.3: settings are saved (config\addons\hifps\settings.lua, all characters): on/off,
 *   frame limit, counter and the experimental toggles, which come back once the game's device exists.
+*   v0.9.4: the target's name pulse. Its alpha is a sine of the game's frame count (16 degrees a
+*   frame, GetNamePlace's colour at 0x083197 -> 0x014D50), so above 60fps it pulsed faster. That one
+*   call now reads a count of whole 1/60s ticks from real time, started from the game's own count so
+*   the pulse doesn't jump; the frame count's other readers (the actor update's every-Nth-frame
+*   throttles) keep the real one.
 *
 *   Bisect mode (local server only): points a group of call sites at a stub that always returns 1.0,
 *   the stock 60fps value, so you can find which site causes a bug. Sites in that group run fast
@@ -175,6 +180,11 @@ local SMOOTH_LOOPS = {
     } },
 };
 local MAX_OPS = 24;
+-- The target's name pulse: 'mov cl, [esi+3]; mov ebp, ecx; call <frame count>; shl eax, 4; cdq;
+-- mov ecx, 360' in GetNamePlace's colour (0x083192); the call at +5. Our count and its getter live
+-- after the operand slots.
+local PULSE_PAT = '8A4E038BE9E8????????C1E00499B968010000';
+local PULSE_OFF = 32 + MAX_OPS * 4;
 
 local MIN_STEP = 0.05;  -- ticks; ~1200fps
 local MAX_STEP = 4.0;   -- ticks; hitches longer than this slow the game down like before
@@ -184,6 +194,8 @@ local state = T{
     smooth      = T{},      -- { addr (immediate), k, backup, prot }
     ops         = T{},      -- { addr (disp32), const (game constant address), v (its value), mode, slot, name, warned }
     getters     = T{},      -- { addr, backup }
+    pulse       = nil,      -- the name pulse's call: { addr, backup (rel32 bytes), target }
+    ticks       = 0,        -- whole 1/60s ticks for it (u32)
     mem         = nil,      -- +0 frac step, +4 whole step, +16 stub code, +24 1.0f
     g_frac      = nil,
     g_int       = nil,
@@ -237,6 +249,29 @@ local function point_site(s, target)
     if (not write_bytes(s.addr + 1, le32(target - (s.addr + 5)))) then return false; end
     s.target = target;
     return true;
+end
+
+-- The name pulse's call pointed at our tick count (state.mem + PULSE_OFF), which starts from the
+-- game's frame count (its getter is 'mov eax, [obj]; mov eax, [eax+0x34]; ret'). Not found: the
+-- pulse stays the game's.
+local function patch_pulse()
+    local p = ashita.memory.find(0, 0, PULSE_PAT, 0, 0);
+    if (p == nil or p == 0) then return; end
+    local site = p + 5;
+    if (ashita.memory.read_uint8(site) ~= 0xE8) then return; end
+    local tgt = call_target(site);
+    local start = 0;
+    if (ashita.memory.read_uint8(tgt) == 0xA1) then
+        local obj = ashita.memory.read_uint32(ashita.memory.read_uint32(tgt + 1));
+        if (obj ~= nil and obj ~= 0) then start = ashita.memory.read_uint32(obj + 0x34); end
+    end
+    local cnt = state.mem + PULSE_OFF;
+    state.ticks = start;
+    ashita.memory.write_uint32(cnt, start);
+    local c = le32(cnt);
+    ashita.memory.write_array(cnt + 4, { 0xA1, c[1], c[2], c[3], c[4], 0xC3 });
+    local s = { addr = site, backup = ashita.memory.read_array(site + 1, 4), target = tgt };
+    if (point_site(s, bit.tobit(cnt + 4))) then state.pulse = s; end
 end
 
 local function find_divisor()
@@ -959,6 +994,10 @@ local function disable()
         for _, o in ipairs(state.ops) do ashita.memory.write_float(o.slot, o.v); end
     end
     state.ops = T{};
+    if (state.pulse ~= nil) then
+        write_bytes(state.pulse.addr + 1, state.pulse.backup);
+        state.pulse = nil;
+    end
     for _, s in ipairs(state.sites) do
         if (s.patched) then write_bytes(s.addr + 1, s.backup); end
     end
@@ -1097,8 +1136,9 @@ local function enable()
     if (#ops > MAX_OPS) then err('Too many operand patches.'); return false; end
 
     -- Our memory: two step floats, and an executable stub "fld dword [1.0]; ret" for bisecting.
-    -- +32: one float slot per redirected operand.
-    local memsize = 32 + MAX_OPS * 4;
+    -- +32: one float slot per redirected operand. Then the name pulse's tick count (u32) and its
+    -- getter "mov eax, [count]; ret".
+    local memsize = PULSE_OFF + 16;
     state.mem = ashita.memory.alloc(memsize);
     if (state.mem == nil or state.mem == 0) then
         err('Could not allocate memory; not patching.');
@@ -1156,6 +1196,7 @@ local function enable()
         disable();
         return false;
     end
+    patch_pulse();
 
     state.div_orig = ashita.memory.read_uint32(state.div_ptr);
     set_divisor(0);
@@ -1475,6 +1516,11 @@ ashita.events.register('d3d_present', 'present_cb', function ()
     local whole = math.floor(state.accum);
     state.accum = state.accum - whole;
     ashita.memory.write_float(state.mem + 4, whole);
+    -- The name pulse counts the same whole ticks: 60 a second at any frame rate.
+    if (state.pulse ~= nil) then
+        state.ticks = (state.ticks + whole) % 4294967296;
+        ashita.memory.write_uint32(state.mem + PULSE_OFF, state.ticks);
+    end
 
     -- Smoothing loops run once per frame; scale their factor to this frame's step.
     for _, l in ipairs(state.smooth) do
