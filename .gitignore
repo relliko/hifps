@@ -1,0 +1,3 @@
+proxy/*.blob
+proxy/*.obj
+__pycache__/
