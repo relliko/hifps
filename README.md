@@ -2,7 +2,7 @@
 
 Ashita v4 addon that runs Final Fantasy XI above 60fps while keeping game speed tied to real time.
 
-> Fixed along the way: lock-on camera (v0.2), late music and pushing through entities (v0.4), blur while turning the camera in motion (v0.5, v0.6), slow lock-on run animation (v0.7.3), other characters microstuttering (v0.8), NPCs sliding in their idle pose (v0.8.1), the target's name pulsing too fast (v0.9.4). Check your server's rules on client modifications before using it.
+> Fixed along the way: lock-on camera (v0.2), late music and pushing through entities (v0.4), blur while turning the camera in motion (v0.5, v0.6), slow lock-on run animation (v0.7.3), other characters microstuttering (v0.8), NPCs sliding in their idle pose (v0.8.1), the target's name pulsing too fast (v0.9.4), other players seeing you walk in bursts when the frame rate is under the cap (v0.9.5). Check your server's rules on client modifications before using it.
 
 ## How it works
 
@@ -11,9 +11,10 @@ The client advances timers, animation and motion by a per-frame step measured in
 hifps:
 
 - replaces both copies of the getter. One returns the real frame time in ticks (fractional), and the other returns whole ticks accumulated from real time (0, 1, 2...).
-- points each of the 218 call sites at the right one: the 120 that truncate the step to an integer get whole ticks, and 90 get the fractional step.
+- points each of the 218 call sites at the right one: the 119 that truncate the step to an integer get whole ticks, and 90 get the fractional step. The one that adds the step to the movement count your client sends while you stand still gets the stock 1 tick.
 - runs the per-tick smoothing loops once per frame and rescales their easing factors, per-tick amounts and delay timer to the real frame time: the camera's three (5 call sites: follow, ease, and distance/collision), so the camera moves every frame at the stock speed, and other characters' movement and turning (3 call sites), so they no longer move one or two passes a frame depending on whether the frame took longer than 1/60s.
 - scales the walk/run animation's per-tick thresholds and smoothing to the frame's step, so slow walkers don't slide in their idle pose.
+- scales the per-tick distance that counts as moving to the frame's step. Your client counts the ticks you spend moving and sends the count to the server, and other players' clients play your walk by it; a short frame used to start the count over mid-walk.
 - gives the target's name pulse a count of whole 1/60s ticks from real time instead of the frame count.
 - sets the fps divisor to 0 (uncapped) and caps the frame rate with its own QueryPerformanceCounter-based limiter.
 

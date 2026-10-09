@@ -1,6 +1,6 @@
 addon.name      = 'hifps';
 addon.author    = 'Relli';
-addon.version   = '0.9.4';
+addon.version   = '0.9.5';
 addon.desc      = 'Runs the client above 60fps by feeding real frame time into the game step.';
 
 require 'common';
@@ -82,6 +82,13 @@ pcall(ffi.cdef, [[
 *   call now reads a count of whole 1/60s ticks from real time, started from the game's own count so
 *   the pulse doesn't jump; the frame count's other readers (the actor update's every-Nth-frame
 *   throttles) keep the real one.
+*   v0.9.5: how other players see you walk. A character counts as moving on a frame where it moved
+*   over 0.02, a constant meant per 1/60s. While you move, the position packet counts the ticks
+*   spent moving (MoveFlame), and a frame that doesn't count as moving starts it over; other
+*   players' clients play your walk over that count's change. Without a cap the game reaches,
+*   some frames are short enough to move under 0.02, so the count restarted mid-walk and others saw
+*   a quick step, a pause, and the walk again. The 0.02 is now scaled to the frame's step, and
+*   the count sent while standing gets the stock 1 tick instead of 0 or 1.
 *
 *   Bisect mode (local server only): points a group of call sites at a stub that always returns 1.0,
 *   the stock 60fps value, so you can find which site causes a bug. Sites in that group run fast
@@ -113,7 +120,7 @@ local INT_SITES = {
     0x0884F5, 0x0885B1, 0x0886B3, 0x088CA7, 0x088CD4, 0x088CF9, 0x088E63, 0x088ECF,
     0x089061, 0x0891FF, 0x089228, 0x0892E7, 0x0893CB, 0x0898F5, 0x089933, 0x089958,
     0x089AFB, 0x089B67, 0x08ADD1, 0x08AE39, 0x08D34B, 0x08D3BE, 0x08D663, 0x08D671,
-    0x08DAAB, 0x08EA21, 0x08ED66, 0x091AD3, 0x09670D, 0x097271, 0x0984D5, 0x0984F6,
+    0x08DAAB, 0x08EA21, 0x08ED66, 0x091AD3, 0x09670D, 0x097271, 0x0984D5,
     0x09F661, 0x0A2843, 0x0AC55D, 0x0AECC0, 0x0B035D, 0x0B578B, 0x0B76A4,
     0x0B7725, 0x0C3568, 0x0C35E9, 0x0CB4ED, 0x1175D5, 0x117766, 0x11777B, 0x1177A2,
     0x11966C, 0x11970C, 0x119F31, 0x1248DC, 0x124D47, 0x1250B0, 0x1251FE, 0x125430,
@@ -127,6 +134,12 @@ local INT_SITES = {
     0x03746F,   -- music start countdown
     0x0A8778,   -- push-through-entity delay
 };
+-- Call sites that get the 1.0 stub, the stock 60fps step, at any frame rate.
+local STOCK_SITES = {
+    -- The position packet's movement counter while standing: 'counter + (int)step', which is 1 at
+    -- stock. Whole ticks made it 0 or 1 frame to frame (v0.9.5).
+    0x0984F6,
+};
 
 -- Fixed-step smoothing loops: "n = (int)step; repeat n times: v += (target - v) * k", with k pushed
 -- as an immediate float. Their call sites get the 1.0 stub (one pass per frame) and the immediate is
@@ -138,6 +151,7 @@ local INT_SITES = {
 -- fallback: how the sites are fed if another addon changed the loop (default whole ticks).
 local CAMERA_EFFECT = 'That part of the camera may blur or move at the wrong speed above 60fps. Unload the other camera addon, or use /hifps limit 60.';
 local ACTOR_EFFECT = 'Other characters may move or turn unevenly above 60fps. Unload the other addon, or use /hifps limit 60.';
+local MOVE_EFFECT = 'Other players may see you walk in bursts above 60fps. Unload the other addon, or use /hifps limit 60.';
 local SMOOTH_LOOPS = {
     { name = 'camera follow', sites = { 0x01F5A2 },           imm = 0x01F5D4, k = 0.25 },
     { name = 'camera ease',   sites = { 0x01F66B, 0x01F711 }, imm = 0x01F6C7, k = 0.05 },
@@ -177,6 +191,14 @@ local SMOOTH_LOOPS = {
         { at = 0x0C8A76, const = 0x32A1A8, mode = 'lin'  },         -- any speed: 0.0001 a tick
         { at = 0x0C8B38, const = 0x329D34, mode = 'pow'  },         -- smoothing: old * 0.75 ...
         { at = 0x0C8B40, const = 0x329CE4, mode = 'ease' },         -- ... + new * 0.25
+    } },
+    -- The 'moving' flag (CXiControlActor::Update, 0A5BA9): this frame's movement over 0.02 sets
+    -- [actor+F8]. While it is set, the position packet (0983F0) counts the ticks spent moving and
+    -- sends the count as MoveFlame; a frame without it starts the count over. Other players' clients
+    -- play your walk over the count's change (08CD20), so a short frame that moved under 0.02 made
+    -- you walk in bursts to them (v0.9.5).
+    { name = 'movement flag', effect = MOVE_EFFECT, sites = {}, ops = {
+        { at = 0x0A5BAB, const = 0x32B7B4, mode = 'lin'  },         -- moved: 0.02 a tick
     } },
 };
 local MAX_OPS = 24;
@@ -1077,7 +1099,7 @@ local function enable()
         end
         return true;
     end
-    if (not add(FRAC_SITES, 'f') or not add(INT_SITES, 'i')) then return false; end
+    if (not add(FRAC_SITES, 'f') or not add(INT_SITES, 'i') or not add(STOCK_SITES, 's')) then return false; end
     local smooth = T{};
     local ops = T{};
     for _, l in ipairs(SMOOTH_LOOPS) do
