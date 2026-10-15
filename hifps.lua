@@ -1,6 +1,6 @@
 addon.name      = 'hifps';
 addon.author    = 'Relli';
-addon.version   = '0.9.5';
+addon.version   = '0.9.6';
 addon.desc      = 'Runs the client above 60fps by feeding real frame time into the game step.';
 
 require 'common';
@@ -89,6 +89,8 @@ pcall(ffi.cdef, [[
 *   some frames are short enough to move under 0.02, so the count restarted mid-walk and others saw
 *   a quick step, a pause, and the walk again. The 0.02 is now scaled to the frame's step, and
 *   the count sent while standing gets the stock 1 tick instead of 0 or 1.
+*   v0.9.6: /hifps exp glows. Glows, the sun's lens flare and doors run the characters' behind-a-wall
+*   GPU readback every frame, and each one stalls the frame; this keeps their results a few frames.
 *
 *   Bisect mode (local server only): points a group of call sites at a stub that always returns 1.0,
 *   the stock 60fps value, so you can find which site causes a bug. Sites in that group run fast
@@ -337,6 +339,12 @@ end
 *             the frame; the client tests each one every 4th frame. Above 60fps this tests every
 *             4m-th frame instead, m = fps/60 rounded down to a power of two, so a result is never
 *             older than at stock 60fps. Targeting reads the result, so this keeps it that fresh.
+*   glows     Glows, the sun's lens flare and doors run the same test, every frame (at night up to
+*             10 a frame, 100-330 us each). Their four calls go through vis_code.lua (built from
+*             proxy/vis.asm, tested by proxy/test_vis.py), which keeps each test object's last result:
+*             glows and the flare for as many frames as 4 at 60fps (4m above 60fps), doors for as
+*             many as 1 at 60fps (m: as fresh as stock at 60fps; a door's result sets the 'hidden' bit
+*             targeting reads). Re-tests are spread over the frames by object.
 *   sse       The client skins characters on the CPU and only uses its SSE code when the CPU says
 *             "Intel"; other CPUs get the x87 code. Turns the SSE code on for them.
 *   batch     The text and UI draw one quad per draw call; consecutive quads with nothing changed
@@ -347,10 +355,13 @@ end
 --]]
 local PROXY = require('proxy_code');
 local PROXY_BUF = 0x20000;      -- bytes of merged vertices: 780 text quads a draw
-local EXP_NAMES = { 'ashita', 'occlusion', 'sse', 'batch', 'dedupe' };
+local VIS = require('vis_code');
+local VIS_TABLE = 256 * 32;     -- vis.asm's table: 256 sets x 2 ways x 16 bytes
+local EXP_NAMES = { 'ashita', 'occlusion', 'glows', 'sse', 'batch', 'dedupe' };
 local EXP_DESC = {
     ashita    = 'skip Ashita\'s per-draw plugin dispatch (d3d_dp/dip/dpup/dipup stop firing)',
     occlusion = 'test hidden characters less often above 60fps, as fresh as stock at 60fps (within 3%)',
+    glows     = 'test hidden glows, the lens flare and doors less often (doors as fresh as stock at 60fps)',
     sse       = 'SSE character skinning on non-Intel CPUs',
     batch     = 'merge consecutive text and UI quads into one draw',
     dedupe    = 'drop device calls that set a value already in effect',
@@ -359,6 +370,7 @@ local EXP_DESC = {
 local EXP_LABEL = {
     ashita    = 'Skip Ashita\'s per-draw plugin dispatch',
     occlusion = 'Test hidden characters less often',
+    glows     = 'Test hidden glows, flares and doors less often',
     sse       = 'SSE character skinning on non-Intel CPUs',
     batch     = 'Batch text and UI quads',
     dedupe    = 'Drop repeated device calls',
@@ -366,6 +378,7 @@ local EXP_LABEL = {
 local EXP_HINT = {
     ashita    = 'Ashita hands each of ~3,000 draws a frame to every plugin and addon. The d3d_dp/dip/dpup/dipup events stop firing; no addon here uses them.',
     occlusion = 'The behind-a-wall test for characters stalls the frame on a GPU readback. Tests every 4m-th frame instead of every 4th above 60fps (m = fps/60, rounded down to 1, 2, 4, 8 or 16), so a result is as fresh as at stock 60fps, within 3% (targeting reads it).',
+    glows     = 'Glows, the sun\'s lens flare and doors run the same GPU readback test as characters, but every frame (at night up to 10 a frame, 100-330 microseconds each). Keeps each result for as many frames as 4 at 60fps for glows and the flare, and for doors as many as 1 at 60fps, so a door is as fresh as stock at 60fps (targeting reads it).',
     sse       = 'The client skins characters on the CPU and only uses its SSE code when the CPU says Intel; this turns it on for other CPUs.',
     batch     = 'Text and UI draw one quad per call; consecutive quads with nothing changed between them become one draw. Same picture.',
     dedupe    = 'About 40% of the client\'s device calls set a value already in effect; these are dropped before they reach Ashita.',
@@ -376,6 +389,7 @@ local exp = {
     on      = {},       -- name -> true
     ashita  = T{},      -- patched jumps { addr }
     occl    = nil,      -- { addr, m }
+    vis     = nil,      -- 'glows': { base, table, sites (while on), nfx, ndoor, prev, rate }; kept allocated once made
     sse     = nil,      -- { addr } of the flag byte we set, or { addr = nil } if it was on already
     proxy   = nil,      -- { base } kept allocated once made (a thread may still be in a thunk)
     dev     = nil,      -- client device object while the proxy is on
@@ -791,6 +805,104 @@ local function occlusion_off()
     exp.occl = nil;
 end
 
+-- glows: the four calls of the occlusion test (thiscall, 9 arguments) that run every frame, pointed
+-- at vis_code.lua's entries. 'at' is the call's offset in the pattern.
+local VIS_SITES = {
+    -- push ecx; push edx; mov ecx, esi; call test; test eax, eax; je; mov al, 1 (a glow: drawn or not)
+    { name = 'glow', pat = '51528BCEE8????????85C07407B0015E83C410C3', at = 4, entry = 'ENTRY_FX' },
+    -- push ecx; push edx; mov ecx, esi; call test; mov [esp+18h], eax; fild [esp+18h] (a glow's strength)
+    { name = 'glow fade', pat = '51528BCEE8????????89442418DB4424185E', at = 4, entry = 'ENTRY_FX' },
+    -- push eax; push ecx; lea ecx, [esi+17Fh]; call test; mov edi, eax (the sun's lens flare)
+    { name = 'lens flare', pat = '50518D8E7F010000E8????????8BF88B8604010000', at = 8, entry = 'ENTRY_FX' },
+    -- push ecx; push edx; lea ecx, [esi+88Ch]; call test; test eax, eax; je (a door; its 'hidden' bit)
+    { name = 'door', pat = '51528D8E8C080000E8????????85C00F84', at = 8, entry = 'ENTRY_DOOR' },
+};
+-- The test's start: mov eax, [renderer]; push ebx; push esi; mov esi, ecx; mov bl, [eax+828h].
+local VIS_TEST = 'A1????????53568BF18A9828080000';
+-- The actor update's call to the frame count getter, whose code is VIS_GETTER (the 'occlusion'
+-- toggle changes the bytes after this call, not these).
+local VIS_FRAME = '8BBEF0090000E8';
+local VIS_GETTER = 'A1????????8B4034C3';
+
+-- True if the bytes at addr match a hex pattern with ?? wildcards.
+local function bytes_match(addr, pat)
+    local n = #pat / 2;
+    local t = ashita.memory.read_array(addr, n);
+    for i = 1, n do
+        local h = pat:sub(2 * i - 1, 2 * i);
+        if (h ~= '??' and t[i] ~= tonumber(h, 16)) then return false; end
+    end
+    return true;
+end
+
+local function vsym(name) return exp.vis.base + VIS.sym[name]; end
+-- Frames a result is kept: as many as 'per60' at 60fps, a power of two, at most cap (3% slack as occlusion).
+local function vis_n(per60, cap)
+    local n = 1;
+    while (n < cap and n * 2 <= state.fps * 1.03 * per60 / 60) do n = n * 2; end
+    return n;
+end
+local function vis_set()
+    if (exp.vis == nil or exp.vis.sites == nil) then return; end
+    exp.vis.nfx, exp.vis.ndoor = vis_n(4, 64), vis_n(1, 16);
+    ashita.memory.write_uint32(vsym('N_FX'), exp.vis.nfx);
+    ashita.memory.write_uint32(vsym('N_DOOR'), exp.vis.ndoor);
+end
+local function glows_on()
+    local test, sites = nil, {};
+    for _, s in ipairs(VIS_SITES) do
+        local p = ashita.memory.find(0, 0, s.pat, 0, 0);
+        if (p == 0) then return ('the %s test call was not found (changed client, or another addon patched it)'):fmt(s.name); end
+        local site = p + s.at;
+        local t = u32(call_target(site));
+        if (test ~= nil and t ~= test) then return ('the %s call goes somewhere else (another addon hooks it)'):fmt(s.name); end
+        test = t;
+        sites[#sites + 1] = { addr = site, backup = ashita.memory.read_array(site + 1, 4), entry = s.entry };
+    end
+    if (not bytes_match(test, VIS_TEST)) then return 'the occlusion test is not the stock code'; end
+    local p = ashita.memory.find(0, 0, VIS_FRAME, 0, 0);
+    if (p == 0) then return 'the frame count was not found'; end
+    local getter = u32(call_target(p + 6));
+    if (not bytes_match(getter, VIS_GETTER)) then return 'the frame count getter is not the stock code'; end
+    if (exp.vis == nil) then
+        local size = VIS.size + 16 + VIS_TABLE;
+        local base = ashita.memory.alloc(size);
+        if (base == nil or base == 0) then return 'could not allocate memory'; end
+        base = u32(base);
+        ashita.memory.unprotect(base, size);
+        local code = {};
+        for i = 1, #VIS.hex, 2 do code[#code + 1] = tonumber(VIS.hex:sub(i, i + 1), 16); end
+        ashita.memory.write_array(base, code);
+        for _, r in ipairs(VIS.relocs) do
+            ashita.memory.write_uint32(base + r, (read_u32(base + r) + base) % 4294967296);
+        end
+        exp.vis = { base = base, table = base + VIS.size + 15 - (base + VIS.size + 15) % 16 };
+    end
+    -- Fresh state: an empty table, counters at 0.
+    local zero = {};
+    for i = 1, VIS_TABLE do zero[i] = 0; end
+    ashita.memory.write_array(exp.vis.table, zero);
+    ashita.memory.write_uint32(vsym('TABLE'), exp.vis.table);
+    ashita.memory.write_uint32(vsym('ORIG_TEST'), test);
+    ashita.memory.write_uint32(vsym('GET_FRAME'), getter);
+    ashita.memory.write_uint32(vsym('S_RUN'), 0);
+    ashita.memory.write_uint32(vsym('S_SKIP'), 0);
+    exp.vis.sites, exp.vis.prev, exp.vis.rate = {}, nil, nil;
+    vis_set();
+    for _, s in ipairs(sites) do
+        if (not write_bytes(s.addr + 1, le32(vsym(s.entry) - (s.addr + 5)))) then return 'could not write the client\'s code'; end
+        exp.vis.sites[#exp.vis.sites + 1] = s;
+    end
+end
+local function glows_off()
+    if (exp.vis == nil or exp.vis.sites == nil) then return; end
+    for _, s in ipairs(exp.vis.sites) do
+        -- Put the call back unless something else has repointed it since.
+        if (u32(call_target(s.addr)) == vsym(s.entry)) then write_bytes(s.addr + 1, s.backup); end
+    end
+    exp.vis.sites = nil;
+end
+
 -- sse: the CPU feature object (getter 'mov eax, [obj]; mov al, [eax+9]; ret'); +9 = SSE skinning.
 local function sse_on()
     local p = ashita.memory.find(0, 0, 'A1????????8A4009C3', 0, 0);
@@ -871,8 +983,8 @@ local function proxy_off()
     exp.dev, exp.vt = nil, nil;
 end
 
-local EXP_ON = { ashita = ashita_on, occlusion = occlusion_on, sse = sse_on, batch = proxy_on, dedupe = proxy_on };
-local EXP_OFF = { ashita = ashita_off, occlusion = occlusion_off, sse = sse_off, batch = proxy_off, dedupe = proxy_off };
+local EXP_ON = { ashita = ashita_on, occlusion = occlusion_on, glows = glows_on, sse = sse_on, batch = proxy_on, dedupe = proxy_on };
+local EXP_OFF = { ashita = ashita_off, occlusion = occlusion_off, glows = glows_off, sse = sse_off, batch = proxy_off, dedupe = proxy_off };
 
 -- Returns an error string, or nil.
 local function exp_set(name, on)
@@ -894,6 +1006,14 @@ end
 -- Once a second from the present callback.
 local function exp_tick()
     if (exp.occl ~= nil) then occl_set(occl_m()); end
+    if (exp.vis ~= nil and exp.vis.sites ~= nil) then
+        vis_set();
+        local now_v = { read_u32(vsym('S_RUN')), read_u32(vsym('S_SKIP')) };
+        if (exp.vis.prev ~= nil) then
+            exp.vis.rate = { now_v[1] - exp.vis.prev[1], now_v[2] - exp.vis.prev[2] };
+        end
+        exp.vis.prev = now_v;
+    end
     ashita_watch();
     if (exp.dev ~= nil) then
         local now_c = { read_u32(psym('S_SKIPPED')), read_u32(psym('S_MERGED')), read_u32(psym('S_BATCHES')) };
@@ -914,6 +1034,13 @@ local function exp_stat(n)
         return ('nothing uses the draw events (%s)'):fmt(exp.checked);
     elseif (n == 'occlusion' and exp.occl ~= nil) then
         return ('every %d frames at %.0f fps'):fmt(4 * (exp.occl.m or 1), state.fps);
+    elseif (n == 'glows' and exp.vis ~= nil and exp.vis.sites ~= nil) then
+        local s = ('glows every %d frames, doors every %d'):fmt(exp.vis.nfx or 1, exp.vis.ndoor or 1);
+        local r = exp.vis.rate;
+        if (r ~= nil and state.fps > 0) then
+            s = s .. ('; %.1f of %.1f tests a frame run'):fmt(r[1] / state.fps, (r[1] + r[2]) / state.fps);
+        end
+        return s;
     elseif (n == 'sse' and exp.sse ~= nil and exp.sse.addr == nil) then
         return 'already on (Intel CPU)';
     elseif (exp.rate ~= nil and state.fps > 0) then

@@ -22,7 +22,7 @@ It checks every call site before patching and refuses to patch if the client doe
 
 ## Install
 
-Copy `hifps.lua` and `proxy_code.lua` to `<Ashita>\addons\hifps\`, then run `/addon load hifps`.
+Copy `hifps.lua`, `proxy_code.lua` and `vis_code.lua` to `<Ashita>\addons\hifps\`, then run `/addon load hifps`.
 
 Settings are saved for all characters in `<Ashita>\config\addons\hifps\settings.lua`: on/off, the frame limit, the counter and the experimental toggles.
 
@@ -54,11 +54,14 @@ Off by default. None of them changes the game step, and each puts back what it c
 | --- | --- |
 | `ashita` | Skips Ashita's per-draw plugin dispatch (about 3,000 draws a frame are handed to every plugin and addon). The `d3d_dp`/`dip`/`dpup`/`dipup` events stop firing, so it first checks the loaded addons and plugins for users of them and refuses if it finds one, and turns itself off if one is loaded later. |
 | `occlusion` | Characters' behind-a-wall test stalls the frame on a GPU readback every 4th frame. Above 60fps it runs every 4m-th frame instead (m = fps/60, rounded down to 1, 2, 4, 8 or 16), so a result is as fresh as at stock 60fps. |
+| `glows` | Glows, the sun's lens flare and doors run the same test every frame (at night up to 10 a frame, 100-330 µs each). Keeps each result for as many frames as 4 at 60fps for glows and the flare (4m frames above 60fps), and for doors as many as 1 at 60fps (m frames), so doors, which targeting reads, are as fresh as at stock 60fps. Re-tests are spread over the frames. |
 | `sse` | The client only uses its SSE character skinning when the CPU says Intel; this turns it on for other CPUs. |
 | `batch` | Text and UI draw one quad per call; consecutive quads with nothing changed between them become one draw. Same picture. |
 | `dedupe` | About 40% of the client's device calls set a value already in effect; these are dropped. |
 
 `batch` and `dedupe` swap a proxy vtable onto the client's device. Its code is `proxy_code.lua`, built from `proxy/proxy.asm` by `proxy/build.py` (MASM) and tested against a simulated device by `proxy/gen_harness.py`.
+
+`glows` points the four calls at `vis_code.lua`, built from `proxy/vis.asm` by the same `proxy/build.py` and tested by `proxy/test_vis.py`, which runs the exact bytes against a fake test and frame count (32-bit MSVC).
 
 ## Compatibility
 
