@@ -1,6 +1,6 @@
 addon.name      = 'hifps';
 addon.author    = 'Relli';
-addon.version   = '0.9.6';
+addon.version   = '0.9.7';
 addon.desc      = 'Runs the client above 60fps by feeding real frame time into the game step.';
 
 require 'common';
@@ -91,6 +91,8 @@ pcall(ffi.cdef, [[
 *   the count sent while standing gets the stock 1 tick instead of 0 or 1.
 *   v0.9.6: /hifps exp glows. Glows, the sun's lens flare and doors run the characters' behind-a-wall
 *   GPU readback every frame, and each one stalls the frame; this keeps their results a few frames.
+*   v0.9.7: /hifps gfx (and the window's Graphics section): brighter, wider-reaching lamp light, and
+*   brighter moonlight and shadow fill, at night. Stock by default.
 *
 *   Bisect mode (local server only): points a group of call sites at a stub that always returns 1.0,
 *   the stock 60fps value, so you can find which site causes a bug. Sites in that group run fast
@@ -318,6 +320,10 @@ local function step_invariant(mode, v)
 end
 
 local function loop_warning(name, effect, addr, detail)
+    if (detail == 'not found in this client') then
+        err(('Warning: the %s code (%08X in the analysed client) was not found in this client, so hifps cannot adjust it. %s'):fmt(name, addr, effect or CAMERA_EFFECT));
+        return;
+    end
     err(('Warning: the %s code at %08X was changed by another addon (%s) in a way hifps cannot adjust for. %s'):fmt(name, addr, detail, effect or CAMERA_EFFECT));
 end
 
@@ -411,7 +417,11 @@ local exp = {
 * turned on, or that hifps turned off by itself, keeps its saved value. Saved toggles are turned on
 * again once the game's device exists.
 --]]
-local prefs = { enabled = true, limit = 240, counter = true, exp = {}, ashita_force = false };
+local prefs = { enabled = true, limit = 240, counter = true, exp = {}, ashita_force = false,
+    gfx = { lamps = 1.0, reach = 1.0, moon = 1.0, fill = 1.0 } };
+-- Graphics settings' ranges (1.0 = stock).
+local LAMPS_MIN, LAMPS_MAX, REACH_MIN, REACH_MAX = 0.5, 3.0, 1.0, 2.0;
+local NIGHT_MIN, NIGHT_MAX = 0.5, 2.5;
 local restore_pending = false;
 
 local function prefs_dir()
@@ -442,6 +452,13 @@ local function load_prefs()
     if (type(t.exp) == 'table') then
         for _, n in ipairs(EXP_NAMES) do prefs.exp[n] = (t.exp[n] == true) or nil; end
     end
+    if (type(t.gfx) == 'table') then
+        local g = t.gfx;
+        if (type(g.lamps) == 'number') then prefs.gfx.lamps = math.max(LAMPS_MIN, math.min(LAMPS_MAX, g.lamps)); end
+        if (type(g.reach) == 'number') then prefs.gfx.reach = math.max(REACH_MIN, math.min(REACH_MAX, g.reach)); end
+        if (type(g.moon) == 'number') then prefs.gfx.moon = math.max(NIGHT_MIN, math.min(NIGHT_MAX, g.moon)); end
+        if (type(g.fill) == 'number') then prefs.gfx.fill = math.max(NIGHT_MIN, math.min(NIGHT_MAX, g.fill)); end
+    end
 end
 
 local function save_prefs()
@@ -460,6 +477,12 @@ local function save_prefs()
     for _, n in ipairs(EXP_NAMES) do
         lines[#lines + 1] = ('        %-9s = %s,'):fmt(n, tostring(prefs.exp[n] == true));
     end
+    lines[#lines + 1] = '    },';
+    lines[#lines + 1] = '    gfx = {                 -- graphics (1.00 = stock)';
+    lines[#lines + 1] = ('        lamps = %.2f,       -- lamp brightness at night'):fmt(prefs.gfx.lamps);
+    lines[#lines + 1] = ('        reach = %.2f,       -- how far lamp light reaches'):fmt(prefs.gfx.reach);
+    lines[#lines + 1] = ('        moon  = %.2f,       -- moonlight at night'):fmt(prefs.gfx.moon);
+    lines[#lines + 1] = ('        fill  = %.2f,       -- shadow fill (ambient light) at night'):fmt(prefs.gfx.fill);
     lines[#lines + 1] = '    },';
     lines[#lines + 1] = '};';
     local f = io.open(dir .. '\\settings.lua', 'w');
@@ -903,6 +926,244 @@ local function glows_off()
     exp.vis.sites = nil;
 end
 
+--[[
+* Graphics (/hifps gfx and the window's Graphics section; saved, stock by default; applied while hifps
+* is on, put back by /hifps off and unload).
+*   lamps/reach  Lamp light at night. gfx_code.lua (built from proxy/gfx.asm, tested by
+*                proxy/test_stubs.py) sits on the three ways a lamp reaches the picture: the zone
+*                shader's lamp constants (17D3AF), the fixed-function lamp lights 1-4 (17CC26, 17CCC2,
+*                17CD5E, 17CDF9) and a character's lamp-lit light (0CB872). 'lamps' scales the
+*                colour, 'reach' the range (the shader lights fully up to the range and not past it,
+*                so the pools grow with the same edge; characters keep the stock reach).
+*   moon/fill    Night lighting: the moonlight's colour and the ambient light that fills shadows,
+*                scaled where the client builds them (188CA0, 188E00), so the zone, characters and
+*                effects all follow; full from 20:00 to 4:00 Vana'diel time, stock by day.
+--]]
+local GFX = require('gfx_code');
+-- Finds the site tables' offsets again after a client update (sites.lua, sigs.lua).
+local LOCATE = require('sites');
+local LAMP_CALLS = {
+    -- push 4; push <lamp constants>; push 15; ...; call [ecx+13Ch] (SetVertexShaderConstant)
+    { name = 'lamp constants', pat = '6A0468????????6A0F8B400C508B08FF913C010000', at = 15, entry = 'VSC_LAMP' },
+    -- mov edx, [ebp+lamp n]; mov ecx, [renderer]; push esi; push edx; call SetLight
+    { name = 'lamp light 1', pat = '8B95B09403008B0D????????5652E8', at = 14, entry = 'LIGHT_LAMP1', target = 'setlight' },
+    { name = 'lamp light 2', pat = '8B95B49403008B0D????????5652E8', at = 14, entry = 'LIGHT_LAMP2', target = 'setlight' },
+    { name = 'lamp light 3', pat = '8B95B89403008B0D????????5652E8', at = 14, entry = 'LIGHT_LAMP3', target = 'setlight' },
+    { name = 'lamp light 4', pat = '8B85BC9403008B0D????????5650E8', at = 14, entry = 'LIGHT_LAMP4', target = 'setlight' },
+    -- mov eax, [esp+ebx+4Ch]; add esi, -3Ch; push eax; push esi; call vec3 *= float (a lamp on a character)
+    { name = 'character lamp', pat = '8B441C4C83C6C45056E8', at = 9, entry = 'ACTOR_LAMP', target = 'scale' },
+};
+-- The functions those calls reach: sub esp, 68h; push ebx; mov ebx, [esp+74h] (SetLight) and
+-- mov eax, [esp+4]; fld [esp+8]; fmul [eax]; fstp [eax] (vec3 *= float).
+local GFX_TARGETS = { setlight = '83EC68538B5C2474', scale = '8B442404D9442408D808D918' };
+
+-- Night lighting: every sun/moon light and ambient colour the client uses comes from two builders on
+-- an environment object (thiscall (out, kind), ret 8; kind 0 the zone, 1 characters): 188CA0 fills a
+-- directional D3DLIGHT8 and 188E00 a D3DCOLOR. Their entries jump to gfx_code.lua, which runs the
+-- builder from a copy of its first instructions and scales the result by MOONF / AMBF. Those follow
+-- the Vana'diel hour: the full setting from 20:00 to 4:00, stock from 7:00 to 17:00, eased between.
+local NIGHT_HOOKS = {
+    -- sub esp, 30h; push ebx; push esi; mov esi, [esp+3Ch]; push edi; mov ebx, ecx; xor edi, edi; mov [esi+34h], edi
+    { name = 'light builder', pat = '83EC3053568B74243C578BD933FF897E34', len = 5, entry = 'LIGHT_HOOK', cont = 'LIGHT_CONT' },
+    -- mov eax, [ecx-1Ch]; sub esp, 20h; cmp eax, 1; push esi; je
+    { name = 'ambient builder', pat = '8B41E483EC2083F8015674', len = 6, entry = 'AMB_HOOK', cont = 'AMB_CONT' },
+};
+-- The Vana'diel clock in Earth seconds: call <clock>; add eax, [offset]; ret (the radar's clock).
+local CLOCK_PAT = 'E8????????0305????????C3';
+
+-- A plain table, like exp.
+local gfx = {
+    base   = nil,   -- gfx_code.lua's block, kept allocated once made
+    calls  = nil,   -- while lamps are changed: { addr, backup, patch }
+    night  = nil,   -- while night lighting is changed: the builders' entries, same fields
+    err    = nil,   -- why the lamps could not be changed
+    nerr   = nil,   -- why night lighting could not be changed
+    clock  = false, -- the Vana'diel clock as an ffi function (nil: not found; false: not looked for yet)
+    hour   = nil,   -- the Vana'diel hour at the last update (fractional)
+    dark   = 0,     -- how much it was night then (0..1)
+    prev   = nil,   -- lamp counters a second ago { constants, lights, characters }
+    rate   = nil,   -- per second, same fields
+};
+local function gsym(name) return gfx.base + GFX.sym[name]; end
+local function round2(v) return math.floor(v * 100 + 0.5) / 100; end
+
+-- gfx_code.lua's block, made once; nil if it could not be.
+local function gfx_block()
+    if (gfx.base ~= nil) then return gfx.base; end
+    local base = ashita.memory.alloc(GFX.size);
+    if (base == nil or base == 0) then return nil; end
+    base = u32(base);
+    ashita.memory.unprotect(base, GFX.size);
+    local code = {};
+    for i = 1, #GFX.hex, 2 do code[#code + 1] = tonumber(GFX.hex:sub(i, i + 1), 16); end
+    ashita.memory.write_array(base, code);
+    for _, r in ipairs(GFX.relocs) do
+        ashita.memory.write_uint32(base + r, (read_u32(base + r) + base) % 4294967296);
+    end
+    gfx.base = base;
+    return base;
+end
+
+-- Puts patched code back, unless something else has changed it since.
+local function unpatch(list)
+    for _, c in ipairs(list or {}) do
+        local have = ashita.memory.read_array(c.addr, #c.patch);
+        local ours = true;
+        for i, b in ipairs(c.patch) do
+            if (have[i] ~= b) then ours = false; break; end
+        end
+        if (ours) then write_bytes(c.addr, c.backup); end
+    end
+end
+
+local function lamps_values()
+    local b, r = prefs.gfx.lamps, prefs.gfx.reach;
+    ashita.memory.write_float(gsym('BRIGHT'), b);
+    ashita.memory.write_float(gsym('REACH'), r);
+    ashita.memory.write_float(gsym('REACH2'), r * r);
+    ashita.memory.write_float(gsym('INV_REACH'), 1 / r);
+    ashita.memory.write_float(gsym('INV_REACH2'), 1 / (r * r));
+end
+local function lamps_off()
+    unpatch(gfx.calls);
+    gfx.calls = nil;
+end
+-- Returns an error string, or nil.
+local function lamps_on()
+    if (gfx.calls ~= nil) then lamps_values(); return nil; end
+    local sites, targets = {}, {};
+    for _, s in ipairs(LAMP_CALLS) do
+        local p = ashita.memory.find(0, 0, s.pat, 0, 0);
+        if (p == nil or p == 0) then return ('the %s call was not found (changed client, or another addon patched it)'):fmt(s.name); end
+        local site = p + s.at;
+        if (s.target == nil) then
+            if (not bytes_match(site, 'FF913C010000')) then return ('the %s call is not the stock code'):fmt(s.name); end
+            sites[#sites + 1] = { s = s, addr = site, len = 6 };
+        else
+            local t = u32(call_target(site));
+            if (not bytes_match(t, GFX_TARGETS[s.target]) or (targets[s.target] ~= nil and targets[s.target] ~= t)) then
+                return ('the %s call goes somewhere else (another addon hooks it)'):fmt(s.name);
+            end
+            targets[s.target] = t;
+            sites[#sites + 1] = { s = s, addr = site, len = 5 };
+        end
+    end
+    if (gfx_block() == nil) then return 'could not allocate memory'; end
+    ashita.memory.write_uint32(gsym('ORIG_SETLIGHT'), targets.setlight);
+    ashita.memory.write_uint32(gsym('ORIG_SCALE'), targets.scale);
+    lamps_values();
+    gfx.calls, gfx.prev, gfx.rate = {}, nil, nil;
+    for _, c in ipairs(sites) do
+        local rel = le32(gsym(c.s.entry) - (c.addr + 5));
+        local patch = { 0xE8, rel[1], rel[2], rel[3], rel[4] };
+        if (c.len == 6) then patch[6] = 0x90; end
+        local backup = ashita.memory.read_array(c.addr, c.len);
+        if (not write_bytes(c.addr, patch)) then return 'could not write the client\'s code'; end
+        gfx.calls[#gfx.calls + 1] = { addr = c.addr, backup = backup, patch = patch };
+    end
+    return nil;
+end
+
+-- The Vana'diel hour (0 to 24, fractional) from the client's clock, or nil if it was not found.
+local function vana_hour()
+    if (gfx.clock == false) then
+        local p = ashita.memory.find(0, 0, CLOCK_PAT, 0, 0);
+        gfx.clock = (p ~= nil and p ~= 0) and ffi.cast('uint32_t (__cdecl *)(void)', p) or nil;
+    end
+    if (gfx.clock == nil) then return nil; end
+    return (tonumber(gfx.clock()) % 3456) / 144;
+end
+-- How much it is night at hour h: 1 from 20:00 to 4:00, 0 from 7:00 to 17:00, linear between.
+local function night_amount(h)
+    if (h == nil) then return 0; end
+    if (h >= 20 or h < 4) then return 1; end
+    if (h < 7) then return (7 - h) / 3; end
+    if (h < 17) then return 0; end
+    return (h - 17) / 3;
+end
+-- The factors for the current hour (from the present callback, once a second, and on changes).
+local function night_values()
+    if (gfx.night == nil) then return; end
+    gfx.hour = vana_hour();
+    gfx.dark = night_amount(gfx.hour);
+    local g = prefs.gfx;
+    ashita.memory.write_float(gsym('MOONF'), 1 + (g.moon - 1) * gfx.dark);
+    ashita.memory.write_float(gsym('AMBF'), 1 + (g.fill - 1) * gfx.dark);
+end
+local function night_off()
+    unpatch(gfx.night);
+    gfx.night = nil;
+end
+-- Returns an error string, or nil.
+local function night_on()
+    if (gfx.night ~= nil) then night_values(); return nil; end
+    local sites = {};
+    for _, h in ipairs(NIGHT_HOOKS) do
+        local p = ashita.memory.find(0, 0, h.pat, 0, 0);
+        if (p == nil or p == 0) then return ('the %s was not found (changed client, or another addon hooks it)'):fmt(h.name); end
+        sites[#sites + 1] = { h = h, addr = p };
+    end
+    if (vana_hour() == nil) then return 'the Vana\'diel clock was not found'; end
+    if (gfx_block() == nil) then return 'could not allocate memory'; end
+    for _, c in ipairs(sites) do ashita.memory.write_uint32(gsym(c.h.cont), c.addr + c.h.len); end
+    gfx.night = {};
+    night_values();
+    for _, c in ipairs(sites) do
+        local rel = le32(gsym(c.h.entry) - (c.addr + 5));
+        local patch = { 0xE9, rel[1], rel[2], rel[3], rel[4] };
+        for i = 6, c.h.len do patch[i] = 0x90; end
+        local backup = ashita.memory.read_array(c.addr, c.h.len);
+        if (not write_bytes(c.addr, patch)) then return 'could not write the client\'s code'; end
+        gfx.night[#gfx.night + 1] = { addr = c.addr, backup = backup, patch = patch };
+    end
+    return nil;
+end
+
+-- Applies the saved graphics settings (hifps on); what failed is in gfx.err / gfx.nerr.
+local function gfx_apply()
+    local g = prefs.gfx;
+    if (g.lamps ~= 1 or g.reach ~= 1) then
+        gfx.err = lamps_on();
+        if (gfx.err ~= nil) then lamps_off(); end
+    else
+        lamps_off();
+        gfx.err = nil;
+    end
+    if (g.moon ~= 1 or g.fill ~= 1) then
+        gfx.nerr = night_on();
+        if (gfx.nerr ~= nil) then night_off(); end
+    else
+        night_off();
+        gfx.nerr = nil;
+    end
+end
+local function gfx_off()
+    lamps_off();
+    night_off();
+end
+
+-- Once a second: the night factors, and how many lamps went through the stub.
+local function gfx_tick()
+    night_values();
+    if (gfx.calls == nil) then return; end
+    local now_c = { read_u32(gsym('S_VSC')), read_u32(gsym('S_LIGHT')), read_u32(gsym('S_ACTOR')) };
+    if (gfx.prev ~= nil) then
+        gfx.rate = { now_c[1] - gfx.prev[1], now_c[2] - gfx.prev[2], now_c[3] - gfx.prev[3] };
+    end
+    gfx.prev = now_c;
+end
+local function gfx_stat()
+    if (gfx.calls == nil or gfx.rate == nil or state.fps <= 0) then return nil; end
+    local r, f = gfx.rate, state.fps;
+    if (r[1] + r[2] + r[3] == 0) then return 'no lamps lit here right now'; end
+    return ('a frame: %.0f lamp-lit meshes, %.0f lamp lights, %.0f lamps on characters'):fmt(r[1] / f, r[2] / f, r[3] / f);
+end
+local function night_stat()
+    if (gfx.night == nil or gfx.hour == nil) then return nil; end
+    local h = math.floor(gfx.hour);
+    return ('Vana\'diel %02d:%02d: night lighting at %d%%'):fmt(h, math.floor((gfx.hour - h) * 60), math.floor(gfx.dark * 100 + 0.5));
+end
+
 -- sse: the CPU feature object (getter 'mov eax, [obj]; mov al, [eax+9]; ret'); +9 = SSE skinning.
 local function sse_on()
     local p = ashita.memory.find(0, 0, 'A1????????8A4009C3', 0, 0);
@@ -1014,6 +1275,7 @@ local function exp_tick()
         end
         exp.vis.prev = now_v;
     end
+    gfx_tick();
     ashita_watch();
     if (exp.dev ~= nil) then
         local now_c = { read_u32(psym('S_SKIPPED')), read_u32(psym('S_MERGED')), read_u32(psym('S_BATCHES')) };
@@ -1122,6 +1384,7 @@ end
 
 local function disable()
     exp_all_off();
+    gfx_off();
     for _, l in ipairs(state.smooth) do
         ashita.memory.write_array(l.addr, l.backup);
         ashita.memory.protect(l.addr, 4, l.prot);
@@ -1211,31 +1474,66 @@ local function enable()
         return false;
     end
 
-    -- Check every call site before touching anything.
+    -- Find the tables' offsets in this client (they move when the client is updated), then check
+    -- every call site before touching anything.
     local base = ashita.memory.get_base('FFXiMain.dll');
+    local found = LOCATE.resolve(ffi.cast('const uint8_t*', base), { addrs[1] - base, addrs[2] - base });
+    local function loc(rva)
+        local o = found.map[rva];
+        return o and (base + o) or nil;
+    end
+    local moved, missing = 0, 0;
+    for rva, o in pairs(found.map) do if (o ~= rva) then moved = moved + 1; end end
     local sites = T{};
+    -- A site that calls neither getter is either left over from an earlier hifps that never put it
+    -- back (it calls a 'fld [x]; ret' stub, or memory that is gone): it is taken back, and unload
+    -- points it at the getter (both getters are the same code). Or something else hooks it: that
+    -- site is left alone. Many of those means a different client, and nothing is patched.
+    local reclaimed, foreign = 0, T{};
+    local function add_at(a, kind)
+        local call = (ashita.memory.read_uint8(a) == 0xE8);
+        local t = call and call_target(a) or nil;
+        local backup = ashita.memory.read_array(a + 1, 4);
+        if (t ~= addrs[1] and t ~= addrs[2]) then
+            if (call and (not readable(u32(t), 7) or bytes_match(u32(t), 'D905????????C3'))) then
+                backup = le32(addrs[1] - (a + 5));
+                reclaimed = reclaimed + 1;
+            else
+                foreign:append(a);
+                backup = nil;
+            end
+        end
+        if (backup ~= nil) then
+            sites:append({ addr = a, kind = kind, backup = backup, target = t, patched = false });
+        end
+    end
+    -- A site not found in this client isn't patched. If its call is still there, it is one of
+    -- found.extra and gets whole ticks below.
     local function add(list, kind)
         for _, rva in ipairs(list) do
-            local a = base + rva;
-            local t = (ashita.memory.read_uint8(a) == 0xE8) and call_target(a) or nil;
-            if (t ~= addrs[1] and t ~= addrs[2]) then
-                err(('Call site %08X does not call the step getter; client differs from the analysed one. Not patching.'):fmt(a));
-                return false;
-            end
-            sites:append({ addr = a, kind = kind, backup = ashita.memory.read_array(a + 1, 4), target = t, patched = false });
+            local a = loc(rva);
+            if (a == nil) then missing = missing + 1; else add_at(a, kind); end
         end
         return true;
     end
-    if (not add(FRAC_SITES, 'f') or not add(INT_SITES, 'i') or not add(STOCK_SITES, 's')) then return false; end
+    add(FRAC_SITES, 'f'); add(INT_SITES, 'i'); add(STOCK_SITES, 's');
     local smooth = T{};
     local ops = T{};
     for _, l in ipairs(SMOOTH_LOOPS) do
         -- Check the loop's constants first. If something else (e.g. another addon) already changed
         -- one, leave this loop on whole ticks instead of refusing to load.
-        local bad = nil;
+        local bad, detail = nil, nil;
         local l_smooth, l_ops = T{}, T{};
-        if (l.imm ~= nil) then
-            local a = base + l.imm;
+        -- Not found in this client: the loop runs as if another addon had changed it.
+        local function lost(rva)
+            bad, detail = base + rva, 'not found in this client';
+        end
+        if (l.imm ~= nil and loc(l.imm) == nil) then lost(l.imm); end
+        for _, o in ipairs(l.ops or {}) do
+            if (bad == nil and loc(o.at) == nil) then lost(o.at); end
+        end
+        if (l.imm ~= nil and bad == nil) then
+            local a = loc(l.imm);
             local kb = ffi.new('float[1]', l.k);
             local want = ffi.string(ffi.cast('const char*', kb), 4);
             local have = ffi.string(ffi.cast('const char*', a), 4);
@@ -1250,19 +1548,24 @@ local function enable()
                 l_smooth:append({ addr = a, k = l.k, backup = ashita.memory.read_array(a, 4) });
             end
         end
-        local detail = nil;
-        if (bad ~= nil) then
+        if (bad ~= nil and detail == nil) then
             local f = ashita.memory.read_array(bad, #(l.pre or { 0x68 }) + 4);
             local hex = T{};
             for _, b in ipairs(f) do hex:append(('%02X'):fmt(b)); end
             detail = 'found ' .. hex:concat(' ');
         end
         for _, o in ipairs(l.ops or {}) do
-            local a = base + o.at;
-            local c = bit.tobit(base + o.const);
+            local a = loc(o.at);
             if (bad == nil) then
                 local d = bit.tobit(ashita.memory.read_uint32(a));
-                if (ashita.memory.read_uint8(a - 2) ~= 0xD8) then
+                -- The constant: where the instruction points, if that's inside the client (another
+                -- addon's redirect points at its own memory); else where it was in the analysed client.
+                local c = bit.tobit(base + o.const);
+                if (u32(d) >= base and u32(d) < base + ashita.memory.get_size('FFXiMain.dll')) then c = d;
+                elseif (a ~= base + o.at) then lost(o.at); end
+                if (bad ~= nil) then
+                    -- Moved, and redirected by another addon: its own constant is unknown.
+                elseif (ashita.memory.read_uint8(a - 2) ~= 0xD8) then
                     local f = ashita.memory.read_array(a - 2, 6);
                     bad, detail = a - 2, ('found %02X %02X %02X %02X %02X %02X'):fmt(f[1], f[2], f[3], f[4], f[5], f[6]);
                 elseif (d ~= c and not step_invariant(o.mode, ashita.memory.read_float(u32(d)))) then
@@ -1283,6 +1586,23 @@ local function enable()
         end
     end
     if (#ops > MAX_OPS) then err('Too many operand patches.'); return false; end
+    -- Calls to the getter no table names (new or changed code in an updated client): whole ticks,
+    -- which keep game time right at any frame rate.
+    for _, o in ipairs(found.extra) do add_at(base + o, 'i'); end
+    if (moved > 0 or missing > 0 or #found.extra > 0) then
+        msg(('Updated client: %d of its offsets moved and were found again, %d not found, %d new call sites on whole ticks.'):fmt(
+            moved, missing, #found.extra));
+    end
+    if (#foreign > 8) then
+        err(('%d call sites do not call the step getter; client differs from the analysed one. Not patching.'):fmt(#foreign));
+        return false;
+    end
+    for _, a in ipairs(foreign) do
+        err(('Call site %08X is hooked by something else; left at stock speed.'):fmt(a));
+    end
+    if (reclaimed > 0) then
+        msg(('Took back %d call site(s) an earlier hifps left patched.'):fmt(reclaimed));
+    end
 
     -- Our memory: two step floats, and an executable stub "fld dword [1.0]; ret" for bisecting.
     -- +32: one float slot per redirected operand. Then the name pulse's tick count (u32) and its
@@ -1351,6 +1671,9 @@ local function enable()
     set_divisor(0);
     state.last = now();
     state.fps_timer = state.last;
+    gfx_apply();
+    if (gfx.err ~= nil) then err('Lamps: ' .. gfx.err .. '.'); end
+    if (gfx.nerr ~= nil) then err('Night lighting: ' .. gfx.nerr .. '.'); end
     msg(('Enabled. %d call sites, limit %s.'):fmt(#state.sites, state.limit > 0 and tostring(state.limit) or 'none'));
     return true;
 end
@@ -1616,6 +1939,59 @@ local function draw_config()
             for _, n in ipairs(EXP_NAMES) do exp_toggle(n, false, true); end
         end
         if (not on) then imgui.EndDisabled(); end
+
+        imgui.SeparatorText('Graphics (stock by default)');
+        if (not on) then
+            imgui.TextDisabled('Turn hifps on to use these.');
+            imgui.BeginDisabled();
+        end
+        local g = prefs.gfx;
+        imgui.PushItemWidth(160);
+        local lb = { g.lamps };
+        if (imgui.SliderFloat('Lamp brightness##hifps_gfx_lamps', lb, LAMPS_MIN, LAMPS_MAX, '%.2fx')) then
+            g.lamps = round2(math.max(LAMPS_MIN, math.min(LAMPS_MAX, lb[1])));
+            gfx_apply();
+        end
+        if (imgui.IsItemDeactivatedAfterEdit()) then save_prefs(); end
+        help('How bright lamps and torches are at night: on the ground, walls and characters near them. 1.00 = stock.');
+        local lr = { g.reach };
+        if (imgui.SliderFloat('Lamp reach##hifps_gfx_reach', lr, REACH_MIN, REACH_MAX, '%.2fx')) then
+            g.reach = round2(math.max(REACH_MIN, math.min(REACH_MAX, lr[1])));
+            gfx_apply();
+        end
+        if (imgui.IsItemDeactivatedAfterEdit()) then save_prefs(); end
+        help('How far lamp light reaches. The game lights a surface fully up to a lamp\'s range and not past it, so this makes the pools of light bigger with the same edge. Characters keep the stock reach. 1.00 = stock.');
+        imgui.Indent(28);
+        local s = gfx_stat();
+        if (s ~= nil) then imgui.TextColored(GREEN, s); end
+        if (gfx.err ~= nil) then imgui.TextColored(RED, gfx.err); end
+        imgui.Unindent(28);
+        local nm = { g.moon };
+        if (imgui.SliderFloat('Night moonlight##hifps_gfx_moon', nm, NIGHT_MIN, NIGHT_MAX, '%.2fx')) then
+            g.moon = round2(math.max(NIGHT_MIN, math.min(NIGHT_MAX, nm[1])));
+            gfx_apply();
+        end
+        if (imgui.IsItemDeactivatedAfterEdit()) then save_prefs(); end
+        help('How bright the moon lights the ground, buildings and characters at night. Full from 20:00 to 4:00 Vana\'diel time, easing in from 17:00 and out by 7:00; daytime is untouched. 1.00 = stock.');
+        local nf = { g.fill };
+        if (imgui.SliderFloat('Night shadow fill##hifps_gfx_fill', nf, NIGHT_MIN, NIGHT_MAX, '%.2fx')) then
+            g.fill = round2(math.max(NIGHT_MIN, math.min(NIGHT_MAX, nf[1])));
+            gfx_apply();
+        end
+        if (imgui.IsItemDeactivatedAfterEdit()) then save_prefs(); end
+        help('How much light fills the sides the moon doesn\'t reach at night (the ambient light). Raise it for less murky nights; lamps still stand out and the sky stays dark. 1.00 = stock.');
+        imgui.PopItemWidth();
+        imgui.Indent(28);
+        s = night_stat();
+        if (s ~= nil) then imgui.TextColored(GREEN, s); end
+        if (gfx.nerr ~= nil) then imgui.TextColored(RED, gfx.nerr); end
+        imgui.Unindent(28);
+        if (imgui.SmallButton('Stock##hifps_gfx_stock')) then
+            g.lamps, g.reach, g.moon, g.fill = 1.0, 1.0, 1.0, 1.0;
+            save_prefs();
+            gfx_apply();
+        end
+        if (not on) then imgui.EndDisabled(); end
         imgui.TextDisabled('Saved for all characters (config\\addons\\hifps\\settings.lua).');
         imgui.PopTextWrapPos();
     end
@@ -1793,6 +2169,40 @@ ashita.events.register('command', 'command_cb', function (e)
         return;
     end
 
+    if (#args >= 2 and args[2] == 'gfx') then
+        local g = prefs.gfx;
+        if (#args >= 3) then
+            if (args[3] == 'lamps' and #args >= 4) then
+                g.lamps = round2(math.max(LAMPS_MIN, math.min(LAMPS_MAX, args[4]:number_or(1))));
+                if (#args >= 5) then g.reach = round2(math.max(REACH_MIN, math.min(REACH_MAX, args[5]:number_or(1)))); end
+            elseif (args[3] == 'night' and #args >= 4) then
+                g.moon = round2(math.max(NIGHT_MIN, math.min(NIGHT_MAX, args[4]:number_or(1))));
+                if (#args >= 5) then g.fill = round2(math.max(NIGHT_MIN, math.min(NIGHT_MAX, args[5]:number_or(1)))); end
+            elseif (args[3] == 'stock') then
+                g.lamps, g.reach, g.moon, g.fill = 1.0, 1.0, 1.0, 1.0;
+            else
+                err(('Usage: /hifps gfx lamps <brightness %.1f-%.1f> [reach %.1f-%.1f], /hifps gfx night <moonlight %.1f-%.1f> [fill %.1f-%.1f], /hifps gfx stock. 1 = stock.')
+                    :fmt(LAMPS_MIN, LAMPS_MAX, REACH_MIN, REACH_MAX, NIGHT_MIN, NIGHT_MAX, NIGHT_MIN, NIGHT_MAX));
+                return;
+            end
+            save_prefs();
+            if (state.mem ~= nil) then gfx_apply(); end
+        end
+        msg(('Graphics (saved): lamp brightness %.2f, lamp reach %.2f, night moonlight %.2f, night shadow fill %.2f (1.00 = stock).')
+            :fmt(g.lamps, g.reach, g.moon, g.fill));
+        if (state.mem == nil) then
+            msg('hifps is off; these apply once it is on (/hifps on).');
+        else
+            if (gfx.err ~= nil) then err('Lamps: ' .. gfx.err .. '.'); end
+            if (gfx.nerr ~= nil) then err('Night lighting: ' .. gfx.nerr .. '.'); end
+            local s = gfx_stat();
+            if (s ~= nil) then msg('Lamps ' .. s .. '.'); end
+            s = night_stat();
+            if (s ~= nil) then msg(s .. '.'); end
+        end
+        return;
+    end
+
     if (#args >= 2 and args[2] == 'mem') then
         local b = state.read_memory();
         local s = slope(now() - 60);
@@ -1873,7 +2283,7 @@ ashita.events.register('command', 'command_cb', function (e)
         return;
     end
 
-    msg(('%s, %.1f fps, step %.3f ticks, limit %s. Commands: /hifps (config window), /hifps limit <n|0>, /hifps counter, /hifps on, /hifps off, /hifps exp [<name|all> [on|off]], /hifps mem, /hifps leak start|stop, /hifps bisect start|fixed|broken|stop'):fmt(
+    msg(('%s, %.1f fps, step %.3f ticks, limit %s. Commands: /hifps (config window), /hifps limit <n|0>, /hifps counter, /hifps on, /hifps off, /hifps exp [<name|all> [on|off]], /hifps gfx [lamps <n> [reach]|night <moon> [fill]|stock], /hifps mem, /hifps leak start|stop, /hifps bisect start|fixed|broken|stop'):fmt(
         state.mem ~= nil and 'Enabled' or 'Disabled', state.fps, state.step,
         state.limit > 0 and tostring(state.limit) or 'none'));
 end);
