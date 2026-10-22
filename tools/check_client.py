@@ -1,12 +1,16 @@
 """Offline check: loads hifps against a client dump and reports where its call sites ended up.
 
-Usage: python tools/check_client.py <FFXiMain_XXXXXXXX.bin> [--shift <offset> <bytes>]
+Usage: python tools/check_client.py <FFXiMain_XXXXXXXX.bin> [--shift <offset> <bytes>] [--walls]
 
 The dump is mapped at its own base (in the file name; that address must be free in this 64-bit
 process) and hifps.lua runs under LuaJIT (lupa) with ashita.memory reading and writing it. Checks:
   - every call site and smoothing loop is found, and each site is patched with its table's kind;
   - calls to the getter no table names get whole ticks;
   - after unload the image is byte for byte what it was.
+--walls also turns the walls toggle on and off (/hifps exp walls): the characters' test call goes to
+walls_code.lua's entry, its copy is the built bytes with their relocations, and the client addresses
+it's handed are the ones the dump's own code holds; off puts the call back, and it's left on for the
+unload check.
 --shift simulates a client update: <bytes> bytes are inserted into .text at <offset> (code after it
 moves, the trailing padding of .text absorbs it, data stays put), with a new call to the getter in
 them. Calls to the getter after the insert are fixed up; other code isn't (nothing here runs it).
@@ -208,6 +212,71 @@ for i in range(1, len(STATE.ops) + 1):
     o = STATE.ops[i]
     d = struct.unpack('<I', rd(int(o.addr) & 0xFFFFFFFF, 4))[0]
     if d != (int(o.slot) & 0xFFFFFFFF): check(False, 'operand at %06X points at its slot' % ((int(o.addr) & 0xFFFFFFFF) - BASE))
+
+if '--walls' in sys.argv:
+    def u32(a): return struct.unpack('<I', rd(a, 4))[0]
+    def target(site): return (site + 5 + struct.unpack('<i', rd(site + 1, 4))[0]) & 0xFFFFFFFF
+    def command(text): events['command'](lua.table_from({'command': text, 'blocked': False})); show()
+    EXP = lua.execute('''
+local fn = ...;
+local i = 1;
+while true do
+    local n, v = debug.getupvalue(fn, i);
+    if (n == nil) then return nil; end
+    if (n == 'exp') then return v; end
+    i = i + 1;
+end''', events['command'])
+    W = lua.eval("package.loaded['walls_code']")
+    site = find('8D8EF0080000E8????????3BC58986F4', 0) + 6
+    stock = rd(site, 5)
+    command('/hifps exp walls on')
+    check(EXP.on['walls'] is True and EXP.walls is not None and EXP.walls.site is not None, 'walls on')
+    if EXP.walls is not None and EXP.walls.site is not None:
+        base = int(EXP.walls.base) & 0xFFFFFFFF
+        def sym(n): return base + int(W.sym[n])
+        code = bytearray(bytes.fromhex(W.hex))
+        for i in range(1, len(W.relocs) + 1):
+            r = int(W.relocs[i])
+            struct.pack_into('<I', code, r, (struct.unpack_from('<I', code, r)[0] + base) & 0xFFFFFFFF)
+        data = [sym(n) for n in ('ORIG_TEST', 'SEG_TEST', 'RENDERER', 'GRID_OFF', 'GAME', 'QPC', 'BUDGET', 'KEEP_A', 'KEEP_B',
+                                 'S_TESTS', 'S_SEGS', 'S_HIDDEN', 'S_SHOWN', 'S_OVER', 'S_FALLBACK', 'S_TICKS')]
+        got_code = bytearray(rd(base, int(W.size)))
+        for a in data: got_code[a - base:a - base + 4] = code[a - base:a - base + 4]
+        check(got_code == code, 'the walls code is the built bytes with their relocations (%d bytes, %d relocations)' % (int(W.size), len(W.relocs)))
+        check(target(site) == sym('ENTRY'), 'the characters\' test call at %06X goes to the walls entry' % (site - BASE))
+        check(u32(sym('ORIG_TEST')) == (site + 5 + struct.unpack('<i', stock[1:])[0]) & 0xFFFFFFFF,
+              'ORIG_TEST is where the call went (%06X)' % (u32(sym('ORIG_TEST')) - BASE))
+        seg = find('81C178010000E9????????90909090908A442404A2????????C3', 0)
+        cam = find('8B0D????????8D94248C0000008D6F44528D4424605550E8????????84C07517', 0)
+        check(u32(sym('SEG_TEST')) == seg and target(cam + 0x17) == seg, 'SEG_TEST is the camera\'s segment test (%06X)' % (seg - BASE))
+        check(u32(sym('RENDERER')) == u32(cam + 2), 'RENDERER is the camera\'s renderer global (%08X)' % u32(cam + 2))
+        check(u32(sym('GRID_OFF')) == 0x178 + rd(find('81ECD0000000535556578BF98B4760C7877C8001000000000085C00F84', 0) + 14, 1)[0],
+              'GRID_OFF is the collision map (+178h) plus its grid field (+60h)')
+        game = u32(find('A1????????0594000000C3', 0) + 1)
+        check(u32(sym('GAME')) == game and u32(find('A1????????0554010000C3', 0) + 1) == game and u32(target(find('8BBEF0090000E8', 0) + 6) + 1) == game,
+              'GAME is the global the view, projection and frame count getters read (%08X)' % game)
+        check(u32(sym('QPC')) != 0, 'QPC set')
+        check(u32(sym('BUDGET')) == int(STATE.freq) // 1000, 'BUDGET is 1 ms of QueryPerformanceCounter ticks (%d)' % u32(sym('BUDGET')))
+        check(u32(sym('NPOINTS')) == 9 and struct.unpack('<ff', rd(sym('MIN_DIST'), 4) + rd(sym('MAX_DIST'), 4)) == (1.0, 100.0),
+              'NPOINTS 9, MIN_DIST 1, MAX_DIST 100')
+        # The present callback's per-frame part (the whole callback would read the client's heap).
+        keep = lua.execute('''
+local fn = ...;
+local i = 1;
+while true do
+    local n, v = debug.getupvalue(fn, i);
+    if (n == nil) then return nil; end
+    if (n == 'walls_keep') then return v; end
+    i = i + 1;
+end''', events['d3d_present'])
+        wr(sym('KEEP_A'), b'\xEE' * 4); wr(sym('USE_STOCK'), b'\xEE' * 4)
+        keep()
+        check(u32(sym('KEEP_A')) == 0 and u32(sym('KEEP_B')) == 0 and u32(sym('USE_STOCK')) == 0,
+              'walls_keep: no actors to keep and no cutscene without the game')
+    command('/hifps exp walls off')
+    check(EXP.on['walls'] is None and rd(site, 5) == stock, 'walls off puts the call back')
+    command('/hifps exp walls on')
+    check(EXP.on['walls'] is True, 'walls on again (left on for the unload check)')
 
 events['unload']()
 show()

@@ -1,6 +1,6 @@
-"""Assemble proxy.asm, vis.asm and gfx.asm and turn each COFF object into a Lua module next to hifps.lua
-(proxy_code.lua, vis_code.lua, gfx_code.lua) and a blob for its test harness. `python build.py gfx`
-builds one.
+"""Assemble proxy.asm, vis.asm, gfx.asm and walls.asm and turn each COFF object into a Lua module next to
+hifps.lua (proxy_code.lua, vis_code.lua, gfx_code.lua, walls_code.lua) and a blob for its test harness.
+`python build.py gfx` builds one.
 
 Each object has one section with code and data. Every DIR32 relocation gets its symbol's section
 offset added here, so at run time hifps only adds the base of its copy to each listed offset.
@@ -17,6 +17,9 @@ MODULES = {
     'gfx': ['BRIGHT', 'REACH', 'REACH2', 'INV_REACH', 'INV_REACH2', 'ORIG_SETLIGHT', 'ORIG_SCALE', 'S_VSC', 'S_LIGHT',
             'S_ACTOR', 'VSC_LAMP', 'LIGHT_LAMP1', 'LIGHT_LAMP2', 'LIGHT_LAMP3', 'LIGHT_LAMP4', 'ACTOR_LAMP',
             'MOONF', 'AMBF', 'LIGHT_CONT', 'AMB_CONT', 'S_MOON', 'S_AMB', 'LIGHT_HOOK', 'AMB_HOOK'],
+    'walls': ['ORIG_TEST', 'SEG_TEST', 'RENDERER', 'GRID_OFF', 'GAME', 'QPC', 'BUDGET', 'NPOINTS', 'MIN_DIST',
+              'MAX_DIST', 'KEEP_A', 'KEEP_B', 'USE_STOCK', 'S_TESTS', 'S_SEGS', 'S_HIDDEN', 'S_SHOWN', 'S_OVER', 'S_FALLBACK',
+              'S_TICKS', 'ENTRY'],
 }
 NSLOTS = 128
 

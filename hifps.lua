@@ -1,6 +1,6 @@
 addon.name      = 'hifps';
 addon.author    = 'Relli';
-addon.version   = '0.9.7';
+addon.version   = '0.9.8';
 addon.desc      = 'Runs the client above 60fps by feeding real frame time into the game step.';
 
 require 'common';
@@ -24,6 +24,10 @@ pcall(ffi.cdef, [[
     int __stdcall IsBadReadPtr(const void* p, size_t size);
     int __stdcall GetModuleHandleExA(uint32_t flags, const void* addr, void** module);
     uint32_t __stdcall GetModuleFileNameA(void* module, char* name, uint32_t size);
+]]);
+pcall(ffi.cdef, [[
+    void* __stdcall GetModuleHandleA(const char* name);
+    void* __stdcall GetProcAddress(void* module, const char* name);
 ]]);
 
 --[[
@@ -345,6 +349,15 @@ end
 *             the frame; the client tests each one every 4th frame. Above 60fps this tests every
 *             4m-th frame instead, m = fps/60 rounded down to a power of two, so a result is never
 *             older than at stock 60fps. Targeting reads the result, so this keeps it that fresh.
+*   walls     Answers that test from the zone's collision instead, with no readback: the actor
+*             draw's call of it goes to walls_code.lua (built from proxy/walls.asm, tested by
+*             proxy/test_stubs.py), which runs the game's own segment test (the one the camera keeps
+*             out of walls with) from the camera's eye to up to 9 points of the character's screen
+*             box at the client's test depth; hidden only when every one is blocked. Scenery without
+*             collision no longer hides characters, nor do characters each other; you and your
+*             target are always shown. At most WALLS_MS of segments a frame (the rest of the frame's
+*             tests answer shown); in cutscenes and with no collision loaded the client's own test
+*             runs. Works with occlusion (which still decides how often each character is tested).
 *   glows     Glows, the sun's lens flare and doors run the same test, every frame (at night up to
 *             10 a frame, 100-330 us each). Their four calls go through vis_code.lua (built from
 *             proxy/vis.asm, tested by proxy/test_vis.py), which keeps each test object's last result:
@@ -363,10 +376,13 @@ local PROXY = require('proxy_code');
 local PROXY_BUF = 0x20000;      -- bytes of merged vertices: 780 text quads a draw
 local VIS = require('vis_code');
 local VIS_TABLE = 256 * 32;     -- vis.asm's table: 256 sets x 2 ways x 16 bytes
-local EXP_NAMES = { 'ashita', 'occlusion', 'glows', 'sse', 'batch', 'dedupe' };
+local WALLS = require('walls_code');
+local WALLS_MS = 1.0;           -- milliseconds of segment tests a frame, then the frame's other tests answer shown
+local EXP_NAMES = { 'ashita', 'occlusion', 'walls', 'glows', 'sse', 'batch', 'dedupe' };
 local EXP_DESC = {
     ashita    = 'skip Ashita\'s per-draw plugin dispatch (d3d_dp/dip/dpup/dipup stop firing)',
     occlusion = 'test hidden characters less often above 60fps, as fresh as stock at 60fps (within 3%)',
+    walls     = 'tell hidden characters from the zone\'s walls on the CPU instead of waiting on the GPU',
     glows     = 'test hidden glows, the lens flare and doors less often (doors as fresh as stock at 60fps)',
     sse       = 'SSE character skinning on non-Intel CPUs',
     batch     = 'merge consecutive text and UI quads into one draw',
@@ -376,6 +392,7 @@ local EXP_DESC = {
 local EXP_LABEL = {
     ashita    = 'Skip Ashita\'s per-draw plugin dispatch',
     occlusion = 'Test hidden characters less often',
+    walls     = 'Hide characters by walls, without a GPU wait',
     glows     = 'Test hidden glows, flares and doors less often',
     sse       = 'SSE character skinning on non-Intel CPUs',
     batch     = 'Batch text and UI quads',
@@ -384,6 +401,7 @@ local EXP_LABEL = {
 local EXP_HINT = {
     ashita    = 'Ashita hands each of ~3,000 draws a frame to every plugin and addon. The d3d_dp/dip/dpup/dipup events stop firing; no addon here uses them.',
     occlusion = 'The behind-a-wall test for characters stalls the frame on a GPU readback. Tests every 4m-th frame instead of every 4th above 60fps (m = fps/60, rounded down to 1, 2, 4, 8 or 16), so a result is as fresh as at stock 60fps, within 3% (targeting reads it).',
+    walls     = 'The behind-a-wall test for characters waits for the GPU to finish the frame so far (about 40% of the frame time in a 77fps profile). This answers it from the zone\'s collision with the game\'s own wall test instead: hidden only when the lines from the camera to 9 points of the character are all blocked. Scenery without collision (leaves, some props) no longer hides characters, and characters don\'t hide each other; you and your target are always shown.',
     glows     = 'Glows, the sun\'s lens flare and doors run the same GPU readback test as characters, but every frame (at night up to 10 a frame, 100-330 microseconds each). Keeps each result for as many frames as 4 at 60fps for glows and the flare, and for doors as many as 1 at 60fps, so a door is as fresh as stock at 60fps (targeting reads it).',
     sse       = 'The client skins characters on the CPU and only uses its SSE code when the CPU says Intel; this turns it on for other CPUs.',
     batch     = 'Text and UI draw one quad per call; consecutive quads with nothing changed between them become one draw. Same picture.',
@@ -395,6 +413,7 @@ local exp = {
     on      = {},       -- name -> true
     ashita  = T{},      -- patched jumps { addr }
     occl    = nil,      -- { addr, m }
+    walls   = nil,      -- { base, site (while on: { addr, backup }), prev, rate }; kept allocated once made
     vis     = nil,      -- 'glows': { base, table, sites (while on), nfx, ndoor, prev, rate }; kept allocated once made
     sse     = nil,      -- { addr } of the flag byte we set, or { addr = nil } if it was on already
     proxy   = nil,      -- { base } kept allocated once made (a thread may still be in a thunk)
@@ -926,6 +945,106 @@ local function glows_off()
     exp.vis.sites = nil;
 end
 
+-- walls: the actor draw's call of the occlusion test, pointed at walls_code.lua's entry. 'at' is the
+-- call's offset in the pattern.
+-- lea ecx, [esi+8F0h]; call test; cmp eax, ebp; mov [esi+9F4h], eax (the character's test object, its result)
+local WALLS_CALL, WALLS_AT = '8D8EF0080000E8????????3BC58986F4', 6;
+-- add ecx, 178h; jmp ...: the segment test, thiscall on the world renderer (from, to, hit), the
+-- collision map at +178h
+local WALLS_SEG = '81C178010000E9????????90909090908A442404A2????????C3';
+-- mov ecx, [renderer]; ...; call segment test; test al, al; jne (the camera's own test: the renderer
+-- global at +2, the call at +17h)
+local WALLS_RENDERER = '8B0D????????8D94248C0000008D6F44528D4424605550E8????????84C07517';
+-- sub esp, 0D0h; ...; mov eax, [edi+60h]; ...; test eax, eax; jz (the collision core: the map's grid
+-- field, 0 while no collision is loaded, is the byte at +14)
+local WALLS_GRID = '81ECD0000000535556578BF98B4760C7877C8001000000000085C00F84';
+-- mov eax, [gGame]; add eax, 94h / 154h; ret (the camera's view and projection; walls.asm reads them
+-- there, and the frame count at +34h)
+local WALLS_VIEW = 'A1????????0594000000C3';
+local WALLS_PROJ = 'A1????????0554010000C3';
+local WALLS_COUNTERS = { 'S_TESTS', 'S_SEGS', 'S_HIDDEN', 'S_SHOWN', 'S_OVER', 'S_FALLBACK', 'S_TICKS' };
+
+local function wsym(name) return exp.walls.base + WALLS.sym[name]; end
+-- The player's and the target's actors (walls always shows them), and the player's status.
+local function walls_actors()
+    local mm = AshitaCore:GetMemoryManager();
+    local ent = mm:GetEntity();
+    local me = mm:GetParty():GetMemberTargetIndex(0);
+    local t = mm:GetTarget():GetTargetIndex(0);
+    return ent:GetActorPointer(me), (t ~= nil and t ~= 0) and ent:GetActorPointer(t) or 0, ent:GetStatus(me);
+end
+-- Every frame while walls is on. In a cutscene (status 4) the client's own test runs: an event camera
+-- can sit inside a wall, where every line from it would be blocked.
+local function walls_keep()
+    local ok, a, b, status = pcall(walls_actors);
+    if (not ok) then a, b, status = 0, 0, nil; end
+    ashita.memory.write_uint32(wsym('KEEP_A'), u32(tonumber(a) or 0));
+    ashita.memory.write_uint32(wsym('KEEP_B'), u32(tonumber(b) or 0));
+    ashita.memory.write_uint32(wsym('USE_STOCK'), status == 4 and 1 or 0);
+end
+local function walls_on()
+    local p = ashita.memory.find(0, 0, WALLS_CALL, 0, 0);
+    if (p == 0) then return 'the characters\' test call was not found (changed client, or another addon patched it)'; end
+    local site = p + WALLS_AT;
+    local test = u32(call_target(site));
+    if (not bytes_match(test, VIS_TEST)) then return 'the characters\' test call goes somewhere else (another addon hooks it)'; end
+    local seg = ashita.memory.find(0, 0, WALLS_SEG, 0, 0);
+    local rp = ashita.memory.find(0, 0, WALLS_RENDERER, 0, 0);
+    local core = ashita.memory.find(0, 0, WALLS_GRID, 0, 0);
+    if (seg == 0 or rp == 0 or core == 0) then return 'the game\'s wall test was not found'; end
+    if (u32(call_target(rp + 0x17)) ~= u32(seg) or ashita.memory.read_uint8(core + 14) ~= 0x60) then
+        return 'the game\'s wall test is not as expected';
+    end
+    local vp = ashita.memory.find(0, 0, WALLS_VIEW, 0, 0);
+    local pp = ashita.memory.find(0, 0, WALLS_PROJ, 0, 0);
+    local fp = ashita.memory.find(0, 0, VIS_FRAME, 0, 0);
+    if (vp == 0 or pp == 0 or fp == 0) then return 'the camera was not found'; end
+    local game = read_u32(vp + 1);
+    local getter = u32(call_target(fp + 6));
+    if (read_u32(pp + 1) ~= game or not bytes_match(getter, VIS_GETTER) or read_u32(getter + 1) ~= game) then
+        return 'the camera is not as expected';
+    end
+    local k32 = ffi.C.GetModuleHandleA('kernel32.dll');
+    local qpc = (k32 ~= nil) and ffi.C.GetProcAddress(k32, 'QueryPerformanceCounter') or nil;
+    if (qpc == nil) then return 'QueryPerformanceCounter was not found'; end
+    if (exp.walls == nil) then
+        local base = ashita.memory.alloc(WALLS.size);
+        if (base == nil or base == 0) then return 'could not allocate memory'; end
+        base = u32(base);
+        ashita.memory.unprotect(base, WALLS.size);
+        local code = {};
+        for i = 1, #WALLS.hex, 2 do code[#code + 1] = tonumber(WALLS.hex:sub(i, i + 1), 16); end
+        ashita.memory.write_array(base, code);
+        for _, r in ipairs(WALLS.relocs) do
+            ashita.memory.write_uint32(base + r, (read_u32(base + r) + base) % 4294967296);
+        end
+        exp.walls = { base = base };
+    end
+    ashita.memory.write_uint32(wsym('ORIG_TEST'), test);
+    ashita.memory.write_uint32(wsym('SEG_TEST'), u32(seg));
+    ashita.memory.write_uint32(wsym('RENDERER'), read_u32(rp + 2));
+    ashita.memory.write_uint32(wsym('GRID_OFF'), 0x178 + 0x60);
+    ashita.memory.write_uint32(wsym('GAME'), game);
+    ashita.memory.write_uint32(wsym('QPC'), u32(tonumber(ffi.cast('uint32_t', qpc))));
+    ashita.memory.write_uint32(wsym('BUDGET'), math.floor(state.freq * WALLS_MS / 1000));
+    ashita.memory.write_uint32(wsym('KEEP_A'), 0);
+    ashita.memory.write_uint32(wsym('KEEP_B'), 0);
+    ashita.memory.write_uint32(wsym('USE_STOCK'), 0);
+    for _, n in ipairs(WALLS_COUNTERS) do ashita.memory.write_uint32(wsym(n), 0); end
+    exp.walls.prev, exp.walls.rate = nil, nil;
+    local s = { addr = site, backup = ashita.memory.read_array(site + 1, 4) };
+    if (not write_bytes(site + 1, le32(wsym('ENTRY') - (site + 5)))) then return 'could not write the client\'s code'; end
+    exp.walls.site = s;
+    walls_keep();
+end
+local function walls_off()
+    if (exp.walls == nil or exp.walls.site == nil) then return; end
+    local s = exp.walls.site;
+    -- Put the call back unless something else has repointed it since.
+    if (u32(call_target(s.addr)) == wsym('ENTRY')) then write_bytes(s.addr + 1, s.backup); end
+    exp.walls.site = nil;
+end
+
 --[[
 * Graphics (/hifps gfx and the window's Graphics section; saved, stock by default; applied while hifps
 * is on, put back by /hifps off and unload).
@@ -1244,8 +1363,8 @@ local function proxy_off()
     exp.dev, exp.vt = nil, nil;
 end
 
-local EXP_ON = { ashita = ashita_on, occlusion = occlusion_on, glows = glows_on, sse = sse_on, batch = proxy_on, dedupe = proxy_on };
-local EXP_OFF = { ashita = ashita_off, occlusion = occlusion_off, glows = glows_off, sse = sse_off, batch = proxy_off, dedupe = proxy_off };
+local EXP_ON = { ashita = ashita_on, occlusion = occlusion_on, walls = walls_on, glows = glows_on, sse = sse_on, batch = proxy_on, dedupe = proxy_on };
+local EXP_OFF = { ashita = ashita_off, occlusion = occlusion_off, walls = walls_off, glows = glows_off, sse = sse_off, batch = proxy_off, dedupe = proxy_off };
 
 -- Returns an error string, or nil.
 local function exp_set(name, on)
@@ -1275,6 +1394,16 @@ local function exp_tick()
         end
         exp.vis.prev = now_v;
     end
+    if (exp.walls ~= nil and exp.walls.site ~= nil) then
+        local now_w = {};
+        for i, n in ipairs(WALLS_COUNTERS) do now_w[i] = read_u32(wsym(n)); end
+        if (exp.walls.prev ~= nil) then
+            local r = {};
+            for i = 1, #now_w do r[i] = (now_w[i] - exp.walls.prev[i]) % 4294967296; end
+            exp.walls.rate = r;
+        end
+        exp.walls.prev = now_w;
+    end
     gfx_tick();
     ashita_watch();
     if (exp.dev ~= nil) then
@@ -1296,6 +1425,17 @@ local function exp_stat(n)
         return ('nothing uses the draw events (%s)'):fmt(exp.checked);
     elseif (n == 'occlusion' and exp.occl ~= nil) then
         return ('every %d frames at %.0f fps'):fmt(4 * (exp.occl.m or 1), state.fps);
+    elseif (n == 'walls' and exp.walls ~= nil and exp.walls.site ~= nil) then
+        -- r: tests, segments, hidden, shown without a clear segment, over budget, the client's test, ticks (a second)
+        local r, f = exp.walls.rate, state.fps;
+        if (r == nil or f <= 0) then return nil; end
+        local ms = r[7] * 1000 / state.freq;
+        local s = ('%.1f tests a frame, %.1f segments, %.2f ms a frame'):fmt(r[1] / f, r[2] / f, ms / f);
+        if (r[2] > 0) then s = s .. (' (%.0f us a segment)'):fmt(ms * 1000 / r[2]); end
+        if (r[1] > 0) then s = s .. ('; %.0f%% hidden'):fmt(100 * r[3] / r[1]); end
+        if (r[5] > 0) then s = s .. ('; %d a second over the %.1f ms budget'):fmt(r[5], WALLS_MS); end
+        if (r[6] > 0) then s = s .. ('; %d a second on the GPU (a cutscene, or no collision)'):fmt(r[6]); end
+        return s;
     elseif (n == 'glows' and exp.vis ~= nil and exp.vis.sites ~= nil) then
         local s = ('glows every %d frames, doors every %d'):fmt(exp.vis.nfx or 1, exp.vis.ndoor or 1);
         local r = exp.vis.rate;
@@ -2016,6 +2156,7 @@ ashita.events.register('d3d_present', 'present_cb', function ()
     draw_config();
     if (state.mem == nil) then return; end
     if (restore_pending) then restore_exp(); end
+    if (exp.walls ~= nil and exp.walls.site ~= nil) then walls_keep(); end
 
     -- Frame limiter: sleep most of the remaining time, then spin.
     if (state.limit > 0) then
