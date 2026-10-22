@@ -1,4 +1,4 @@
-"""Builds the stub modules (build.py vis gfx walls) and runs each one's harness (<name>_harness.c) against the
+"""Builds the stub modules (build.py gfx walls) and runs each one's harness (<name>_harness.c) against the
 exact bytes. `python test_stubs.py gfx` runs one. 32-bit MSVC, no CRT, no Windows SDK: the
 kernel32/user32 import libraries come from stub DLLs built in a temporary folder (their .def exports
 the plain names, so the decorated stdcall symbols import those)."""
@@ -6,7 +6,7 @@ import os, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 VC = r'C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars32.bat'
-MODULES = ['vis', 'gfx', 'walls']
+MODULES = ['gfx', 'walls']
 # dll, { function: stdcall argument count, or None for cdecl varargs }
 STUBS = {
     'k32': ('kernel32.dll', {'VirtualAlloc': 4, 'CreateFileA': 7, 'ReadFile': 5, 'GetStdHandle': 1, 'WriteFile': 5,

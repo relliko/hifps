@@ -22,7 +22,7 @@ It checks every call site before patching. Unloading restores every original byt
 
 ## Install
 
-Copy `hifps.lua`, `sites.lua`, `sigs.lua`, `proxy_code.lua`, `vis_code.lua`, `gfx_code.lua` and `walls_code.lua` to `<Ashita>\addons\hifps\`, then run `/addon load hifps`.
+Copy `hifps.lua`, `sites.lua`, `sigs.lua`, `proxy_code.lua`, `gfx_code.lua` and `walls_code.lua` to `<Ashita>\addons\hifps\`, then run `/addon load hifps`.
 
 Settings are saved for all characters in `<Ashita>\config\addons\hifps\settings.lua`: on/off, the frame limit, the counter, the experimental toggles and the graphics settings.
 
@@ -59,14 +59,13 @@ Off by default. None of them changes the game step, and each puts back what it c
 | `ashita` | Skips Ashita's per-draw plugin dispatch (about 3,000 draws a frame are handed to every plugin and addon). The `d3d_dp`/`dip`/`dpup`/`dipup` events stop firing, so it first checks the loaded addons and plugins for users of them and refuses if it finds one, and turns itself off if one is loaded later. |
 | `occlusion` | Characters' behind-a-wall test stalls the frame on a GPU readback every 4th frame. Above 60fps it runs every 4m-th frame instead (m = fps/60, rounded down to 1, 2, 4, 8 or 16), so a result is as fresh as at stock 60fps. |
 | `walls` | Answers that test from the zone's collision instead, so nothing waits on the GPU (the wait was about 40% of the main thread in a 77fps profile). It uses the game's own wall test, the one the camera keeps out of walls with, from the camera to up to 9 points of the character's on-screen box. A character is hidden only when every line is blocked. Scenery without collision (leaves, some props) no longer hides characters, and characters don't hide each other. You and your target are always shown. Segment tests are capped at 1 ms a frame; the rest of that frame's tests answer shown. In cutscenes (an event camera can sit inside a wall) and with no collision loaded, the client's own test runs. Works together with `occlusion`, which still sets how often each character is tested. |
-| `glows` | Glows, the sun's lens flare and doors run the same test every frame (at night up to 10 a frame, 100-330 µs each). Keeps each result for as many frames as 4 at 60fps for glows and the flare (4m frames above 60fps), and for doors as many as 1 at 60fps (m frames), so doors, which targeting reads, are as fresh as at stock 60fps. Re-tests are spread over the frames. |
 | `sse` | The client only uses its SSE character skinning when the CPU says Intel; this turns it on for other CPUs. |
 | `batch` | Text and UI draw one quad per call; consecutive quads with nothing changed between them become one draw. Same picture. |
 | `dedupe` | About 40% of the client's device calls set a value already in effect; these are dropped. |
 
 `batch` and `dedupe` swap a proxy vtable onto the client's device. Its code is `proxy_code.lua`, built from `proxy/proxy.asm` by `proxy/build.py` (MASM) and tested against a simulated device by `proxy/gen_harness.py`.
 
-`glows` points the four calls at `vis_code.lua`, built from `proxy/vis.asm` by the same `proxy/build.py`; `walls` points the characters' call at `walls_code.lua`, built from `proxy/walls.asm`.
+`walls` points the characters' call at `walls_code.lua`, built from `proxy/walls.asm` by the same `proxy/build.py`.
 
 ## Graphics
 
@@ -81,7 +80,7 @@ Stock by default; in the config window's Graphics section or with `/hifps gfx`. 
 
 The lamp settings point the client's three lamp paths (the zone shader's lamp constants, the fixed-function lamp lights and a character's lamp-lit light) at `gfx_code.lua`, built from `proxy/gfx.asm`. The night settings hook the two functions every sun/moon light and ambient colour comes from, so the zone, characters and effects all follow. They apply fully from 20:00 to 4:00 Vana'diel time, ease in from 17:00 and out by 7:00, and leave daytime alone.
 
-`proxy/test_stubs.py` runs the exact bytes of `vis_code.lua`, `gfx_code.lua` and `walls_code.lua` against fakes of what the client calls (32-bit MSVC). For `walls` that's a camera, collision boxes and the game's box-and-depth maths, checking every point and line against a model.
+`proxy/test_stubs.py` runs the exact bytes of `gfx_code.lua` and `walls_code.lua` against fakes of what the client calls (32-bit MSVC). For `walls` that's a camera, collision boxes and the game's box-and-depth maths, checking every point and line against a model.
 
 ## Compatibility
 
