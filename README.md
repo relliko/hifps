@@ -78,7 +78,7 @@ Stock by default; in the config window's Graphics section or with `/hifps gfx`. 
 | `moon` | How bright the moon lights the ground, buildings and characters at night. |
 | `fill` | How much light fills the sides the moon doesn't reach at night (the ambient light): less murky nights, while lamps still stand out and the sky stays dark. |
 
-The lamp settings point the client's three lamp paths (the zone shader's lamp constants, the fixed-function lamp lights and a character's lamp-lit light) at `gfx_code.lua`, built from `proxy/gfx.asm`. The night settings hook the two functions every sun/moon light and ambient colour comes from, so the zone, characters and effects all follow. They apply fully from 20:00 to 4:00 Vana'diel time, ease in from 17:00 and out by 7:00, and leave daytime alone.
+The lamp settings point the client's three lamp paths (the zone shader's lamp constants, the fixed-function lamp lights and a character's lamp-lit light) at `gfx_code.lua`, built from `proxy/gfx.asm`. The night settings hook the two functions every sun/moon light and ambient colour comes from, so the zone, characters and effects all follow. They apply fully from 20:00 to 4:00 Vana'diel time, ease in from 17:00 and out by 7:00, and leave daytime alone. The game starts its Vana'diel clock while you log in; until then night lighting stays stock and hifps doesn't touch the clock (before 0.9.10, loading hifps at game start with night lighting saved crashed Ashita's addons).
 
 `proxy/test_stubs.py` runs the exact bytes of `gfx_code.lua` and `walls_code.lua` against fakes of what the client calls (32-bit MSVC). For `walls` that's a camera, collision boxes and the game's box-and-depth maths, checking every point and line against a model.
 

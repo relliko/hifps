@@ -1,6 +1,6 @@
 addon.name      = 'hifps';
 addon.author    = 'Relli';
-addon.version   = '0.9.9';
+addon.version   = '0.9.10';
 addon.desc      = 'Runs the client above 60fps by feeding real frame time into the game step.';
 
 require 'common';
@@ -100,6 +100,8 @@ pcall(ffi.cdef, [[
 *   v0.9.8: /hifps exp walls. The characters' behind-a-wall test is answered from the zone's
 *   collision instead of a GPU readback that waits for the GPU.
 *   v0.9.9: glows removed: keeping glow results a few frames made the worldfx add-on's shadows flicker.
+*   v0.9.10: with night lighting saved, loading hifps at game start no longer crashes Ashita's addons.
+*   The game's clock isn't running until you log in; night lighting now waits for it.
 *
 *   Bisect mode (local server only): points a group of call sites at a stub that always returns 1.0,
 *   the stock 60fps value, so you can find which site causes a bug. Sites in that group run fast
@@ -1001,6 +1003,11 @@ local NIGHT_HOOKS = {
 };
 -- The Vana'diel clock in Earth seconds: call <clock>; add eax, [offset]; ret (the radar's clock).
 local CLOCK_PAT = 'E8????????0305????????C3';
+-- What it calls: call <tick>; jmp <seconds>. The tick starts push esi; push edi; call <now>;
+-- mov edi, [clock object]; mov esi, eax; push esi; mov eax, [edi]. The client sets that pointer while
+-- it starts up; until then (the title screen, logging in) the clock reads through a null pointer.
+local CLOCK_CALL = 'E8????????E9';
+local CLOCK_TICK = '5657E8????????8B3D????????8BF0568B07';
 
 -- A plain table, like exp.
 local gfx = {
@@ -1010,7 +1017,8 @@ local gfx = {
     err    = nil,   -- why the lamps could not be changed
     nerr   = nil,   -- why night lighting could not be changed
     clock  = false, -- the Vana'diel clock as an ffi function (nil: not found; false: not looked for yet)
-    hour   = nil,   -- the Vana'diel hour at the last update (fractional)
+    clock_obj = nil, -- where the client keeps its clock object's address (0 until the clock runs)
+    hour   = nil,   -- the Vana'diel hour at the last update (fractional; nil while the clock isn't running)
     dark   = 0,     -- how much it was night then (0..1)
     prev   = nil,   -- lamp counters a second ago { constants, lights, characters }
     rate   = nil,   -- per second, same fields
@@ -1095,13 +1103,24 @@ local function lamps_on()
     return nil;
 end
 
--- The Vana'diel hour (0 to 24, fractional) from the client's clock, or nil if it was not found.
+-- Looks for the Vana'diel clock once: gfx.clock is then the ffi function, or nil if not found.
+local function find_clock()
+    if (gfx.clock ~= false) then return gfx.clock; end
+    gfx.clock = nil;
+    local p = ashita.memory.find(0, 0, CLOCK_PAT, 0, 0);
+    if (p == nil or p == 0) then return nil; end
+    local call = u32(call_target(p));
+    if (not bytes_match(call, CLOCK_CALL)) then return nil; end
+    local tick = u32(call_target(call));
+    if (not bytes_match(tick, CLOCK_TICK)) then return nil; end
+    gfx.clock_obj = read_u32(tick + 9);
+    gfx.clock = ffi.cast('uint32_t (__cdecl *)(void)', p);
+    return gfx.clock;
+end
+-- The Vana'diel hour (0 to 24, fractional) from the client's clock, or nil if it was not found or the
+-- client hasn't started it yet (calling it then would crash the game).
 local function vana_hour()
-    if (gfx.clock == false) then
-        local p = ashita.memory.find(0, 0, CLOCK_PAT, 0, 0);
-        gfx.clock = (p ~= nil and p ~= 0) and ffi.cast('uint32_t (__cdecl *)(void)', p) or nil;
-    end
-    if (gfx.clock == nil) then return nil; end
+    if (find_clock() == nil or read_u32(gfx.clock_obj) == 0) then return nil; end
     return (tonumber(gfx.clock()) % 3456) / 144;
 end
 -- How much it is night at hour h: 1 from 20:00 to 4:00, 0 from 7:00 to 17:00, linear between.
@@ -1134,7 +1153,8 @@ local function night_on()
         if (p == nil or p == 0) then return ('the %s was not found (changed client, or another addon hooks it)'):fmt(h.name); end
         sites[#sites + 1] = { h = h, addr = p };
     end
-    if (vana_hour() == nil) then return 'the Vana\'diel clock was not found'; end
+    -- Before the client starts its clock the factors stay stock; gfx_tick looks again every second.
+    if (find_clock() == nil) then return 'the Vana\'diel clock was not found'; end
     if (gfx_block() == nil) then return 'could not allocate memory'; end
     for _, c in ipairs(sites) do ashita.memory.write_uint32(gsym(c.h.cont), c.addr + c.h.len); end
     gfx.night = {};
@@ -1190,7 +1210,8 @@ local function gfx_stat()
     return ('a frame: %.0f lamp-lit meshes, %.0f lamp lights, %.0f lamps on characters'):fmt(r[1] / f, r[2] / f, r[3] / f);
 end
 local function night_stat()
-    if (gfx.night == nil or gfx.hour == nil) then return nil; end
+    if (gfx.night == nil) then return nil; end
+    if (gfx.hour == nil) then return 'Night lighting starts once the game\'s clock runs (after logging in)'; end
     local h = math.floor(gfx.hour);
     return ('Vana\'diel %02d:%02d: night lighting at %d%%'):fmt(h, math.floor((gfx.hour - h) * 60), math.floor(gfx.dark * 100 + 0.5));
 end
